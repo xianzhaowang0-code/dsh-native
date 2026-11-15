@@ -13,9 +13,9 @@ whenToUse: 用户要求「写插件」「AI 做插件并装测」「修改鲸歌
 1. 用 `plugin_dev_list` 看已有插件、工具/壳登记和权限，确认目标与是否升级同 id 包。按需读取目标源码或插件详情中的公开能力信息；不要读取凭据来凑示例。
 2. 用 `plugin_dev_scaffold` 或工作区文件工具生成包。只实现用户需要的角色，声明实际使用的权限。工具的具体参数先看本次暴露的 schema，不猜参数名。
 3. 用 `plugin_dev_test` 对包试运行，检查返回的错误、tools、shells、loadings、unsupported、missingServices；参数 schema 与其它角色登记再核对源码和插件详情，不假设工具返回所有内部字段。试运行会执行模块与 `apply`，不是纯语法检查；也不等于工具 execute、页面交互或外部 API 已验收。
-4. 修完后用 `plugin_dev_install` 安装，再按用户要求用 `plugin_dev_enable` 启停；修改已安装包后用 `plugin_dev_reload` 重载并重新查看登记。沿用宿主现有审批与权限机制，不能把安装/启用等同于危险权限授权。
+4. 修完后用 `plugin_dev_install` 安装（**导入默认停用**，新包不会自动进角色），再按用户要求用 `plugin_dev_enable` 启用；修改已安装包后用 `plugin_dev_reload` 重载并重新查看登记。沿用宿主现有审批与权限机制，不能把安装/启用等同于危险权限授权。
 5. 实际调用新增工具，或打开插件页面检查交互；整壳/agent/storage/prompt/model 注册成功不等于已被选中。用户要求装测时完成可执行验证，不停在「可以安装」。安装整壳不自动切换当前壳。
-6. 回报插件 id/版本、包位置、权限、实际验证及未验证项。出错先停用本插件、重载已知可用版本；角色切换按设置里的恢复入口操作，不删除用户会话或擅自改授权表。
+6. 回报插件 id/版本、包位置、权限、实际验证及未验证项。出错先停用本插件、重载已知可用版本；角色切换按设置里的恢复入口操作，不删除用户会话或擅自改授权表。删除用 `plugin_dev_delete`：正在使用/运行中的插件会被拒绝，先 `plugin_dev_enable {enabled:false}` 停用（会自动回退内置角色）再删。
 
 工具参数速查（path 相对 ToolContext 当前目录解析并受工作区边界约束；执行前核对当前 schema）：
 
@@ -24,14 +24,15 @@ whenToUse: 用户要求「写插件」「AI 做插件并装测」「修改鲸歌
 | `plugin_dev_list` | `{}` 或 `{id:'whale-hello'}` | 列表或按 id 查询版本、路径、工具、壳、loadings、开关、权限及错误；loadings 含 id/label/protocol/selectionValue，不返回树、配置/服务值或当前选中状态。 |
 | `plugin_dev_scaffold` | `{path:'my-plugin',id:'whale-hello',template:'tool'}` | 父目录须存在，不覆盖现有目录；id 为 1–80 字符且不可为 builtin.*。生成清单/入口/说明；template 还可为 surface-shell、webview-shell、loading。 |
 | `plugin_dev_test` | `{path:'my-plugin'}` | 目录或 zip，隔离运行 apply 收集工具/壳/loadings 元数据；不执行工具、不落 registry、不接用户文件/网络/设备能力；不验证冷启动画面。 |
-| `plugin_dev_install` | `{path:'my-plugin'}` | 目录或 zip，边界检查及试运行通过后暂存/备份/替换/持久化，失败回滚；旧配置只保留新 schema 支持的键。 |
-| `plugin_dev_enable` | `{id:'whale-hello',enabled:true}` | 启停，不自动选择壳或授危险权限。 |
+| `plugin_dev_install` | `{path:'my-plugin'}` | 目录或 zip，边界检查及试运行通过后暂存/备份/替换/持久化，失败回滚；旧配置只保留新 schema 支持的键；**新装默认停用**（升级保留原开关）。 |
+| `plugin_dev_enable` | `{id:'whale-hello',enabled:true}` | 启停，不自动选择壳或授危险权限；停用会清掉指向它的角色选择并静默回退内置。 |
+| `plugin_dev_delete` | `{id:'whale-hello'}` | 删除插件目录并清角色选择；正在使用/运行中的插件会被拒绝，先停用再删。 |
 | `plugin_dev_reload` | `{id:'whale-hello'}` | 先隔离测试已安装包，再重载并刷新登记。 |
 | `plugin_dev_call` | `{id:'whale-hello',tool:'whale_hello',args:{name:'鲸歌'}}` | 真实执行已启用且接入的插件工具，沿用参数校验、权限、超时与当前审批，可能产生副作用。 |
 | `plugin_dev_test_shell` | `{id:'whale-hello',shell:'hello-shell',action:'restore',value:{}}` | 临时运行真实 apply/mount/state/action，校验 Surface 树或非空 HTML；合成空会话，宿主命令只记录不执行，不切当前壳，也不证明实际画面已验收。单壳时可省 shell，action/value 可省。 |
 | `plugin_dev_test_capability` | `{capability:'hello.echo',args:{text:'你好'}}` | 真正调用已授权能力；不绕过提供方权限或超时，可能产生实际效果。 |
 
-同 id 的 `install` 沿用重装语义：保留新 schema 兼容的用户配置，重新启用插件，收回旧危险授权后须重新确认；`reload` 会保留新清单仍声明的已有授权。安装失败的回滚覆盖进程内异常，不代表断电或被系统杀进程时具备完整事务恢复。
+同 id 的 `install` 沿用重装语义：保留新 schema 兼容的用户配置，**保留原来的启用开关**（新装默认停用，不会因为重装被悄悄启用/停用），收回旧危险授权后须重新确认；`reload` 会保留新清单仍声明的已有授权。安装失败的回滚覆盖进程内异常，不代表断电或被系统杀进程时具备完整事务恢复。
 
 list/test 在现有只读审批名单；其余沿用现有写工具审批策略，ask 模式询问、auto 模式允许，不另加「每次都必须问」的规则。危险权限仍走插件页逐项授权；若因此无法完成实际功能验证，如实记录所缺授权，不修改授权表。
 

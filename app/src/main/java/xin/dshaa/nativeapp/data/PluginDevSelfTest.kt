@@ -35,8 +35,13 @@ internal object PluginDevSelfTest {
                 val install = call("plugin_dev_install", args("path" to path.path))
                 if (!install.isError) installed += id
                 record("$template install", !install.isError, install.text)
+                // 0.3.4（用户第 5 条）：导入后默认停用。
+                if (!install.isError) record("$template install defaults disabled", install.text.contains("默认停用"), install.text)
                 val listed = call("plugin_dev_list", args("id" to id))
                 record("$template list", !listed.isError && listed.text.contains(id), listed.text)
+                // 0.3.4：导入默认停用，后面的工具/壳测试前先显式启用（与用户操作一致）。
+                val enabledForTest = call("plugin_dev_enable", buildJsonObject { put("id", id); put("enabled", true) })
+                record("$template enable", !enabledForTest.isError, enabledForTest.text)
                 if (template == "tool") {
                     val tool = id.replace(Regex("[^A-Za-z0-9_]"), "_") + "_hello"
                     val executed = call("plugin_dev_call", buildJsonObject {
@@ -54,6 +59,11 @@ internal object PluginDevSelfTest {
                     val bad = call("plugin_dev_install", args("path" to path.path))
                     val after = call("plugin_dev_call", buildJsonObject { put("id", id); put("tool", tool); put("args", buildJsonObject { put("name", "ROLLBACK") }) })
                     record("failed upgrade preserves old tool", bad.isError && !after.isError && after.text.contains("ROLLBACK"), bad.text + "\n" + after.text)
+                    // 0.3.4（用户第 5/7 条）：停用后可以删除；删除后 plugin_dev_list 查不到。
+                    call("plugin_dev_enable", buildJsonObject { put("id", id); put("enabled", false) })
+                    val deleted = call("plugin_dev_delete", args("id" to id))
+                    val gone = call("plugin_dev_list", args("id" to id))
+                    record("tool delete after disable", !deleted.isError && gone.isError, deleted.text + "\n" + gone.text)
                 } else {
                     val probe = call("plugin_dev_test_shell", args("id" to id, "action" to "close"))
                     val report = runCatching { Json.parseToJsonElement(probe.text).jsonObject }.getOrNull()
@@ -76,6 +86,8 @@ internal object PluginDevSelfTest {
             """.trimIndent(), Charsets.UTF_8)
             val capInstall = call("plugin_dev_install", args("path" to capPath.path))
             if (!capInstall.isError) installed += capId
+            // 0.3.4：导入默认停用，能力/工具探针都要先显式启用（与用户操作一致）。
+            call("plugin_dev_enable", buildJsonObject { put("id", capId); put("enabled", true) })
             delay(1200)
             val capResult = call("plugin_dev_test_capability", buildJsonObject {
                 put("capability", capId); put("args", buildJsonObject { put("text", "M86_CAP_OK") })
@@ -99,6 +111,8 @@ internal object PluginDevSelfTest {
             """.trimIndent(), Charsets.UTF_8)
             val deniedInstall = call("plugin_dev_install", args("path" to deniedPath.path))
             if (!deniedInstall.isError) installed += deniedId
+            // 0.3.4：先启用，才会走到「没授 shell」这一步；否则会误报「工具未接入」。
+            call("plugin_dev_enable", buildJsonObject { put("id", deniedId); put("enabled", true) })
             val denied = call("plugin_dev_call", args("id" to deniedId, "tool" to "m86_permission_$suffix"))
             record("dangerous shell permission not auto granted", denied.isError && (denied.text.contains("PERMISSION") || denied.text.contains("权限") || denied.text.contains("授权")), denied.text)
         } catch (e: Exception) {

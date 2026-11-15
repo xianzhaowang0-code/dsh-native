@@ -349,7 +349,8 @@ fun AssistantScreen(
             }
 
             // ======= 插件预设（M74：组合包里的 @deepseek-ai/dsh-agent-preset） =======
-            val withPresets = plugins.filter { it.presets.isNotEmpty() }
+            // 0.3.4（用户第 4 条）：只列启用中的插件——停用/已删除的插件不再出现在「角色」范围里。
+            val withPresets = plugins.filter { it.enabled && it.presets.isNotEmpty() }
             if (withPresets.isNotEmpty()) {
                 Spacer(Modifier.height(16.dp))
                 SettingsSectionHeader(icon = Icons.Rounded.Extension, title = "插件预设")
@@ -365,8 +366,7 @@ fun AssistantScreen(
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                             )
-                            if (!record.enabled) Pill("插件已停用", c.faint) else Pill("可套用", c.brandBright)
-                        }
+                            Pill("可套用", c.brandBright)                        }
                         Spacer(Modifier.height(4.dp))
                         record.presets.forEach { preset ->
                             Column(
@@ -445,12 +445,13 @@ fun AssistantScreen(
                 SettingsInfoBanner(
                     "插件预设读自组合包的 cordis.patch.yml（@deepseek-ai/dsh-agent-preset + dsh-persona 的 " +
                         "prefix/suffix）。套用只是把这两段文本复制成一份新的角色卡并设为当前使用，" +
-                        "补丁里的其它配置（子插件、工具开关）鲸歌不执行；预设本体仍跟着插件走，卸载插件后这里会消失。",
+                        "补丁里的其它配置（子插件、工具开关）鲸歌不执行；预设本体仍跟着插件走，停用或卸载插件后这里会消失。",
                 )
             }
 
             // ======= 插件自带的助手配置（只读，M73） =======
-            val withPrompt = plugins.filter { it.promptSections.isNotEmpty() || it.contexts.isNotEmpty() }
+            // 0.3.4：同样只列启用中的插件。
+            val withPrompt = plugins.filter { it.enabled && (it.promptSections.isNotEmpty() || it.contexts.isNotEmpty()) }
             Spacer(Modifier.height(16.dp))
             SettingsSectionHeader(icon = Icons.Rounded.Extension, title = "插件自带的助手配置")
             SettingsCard {
@@ -474,7 +475,7 @@ fun AssistantScreen(
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis,
                                 )
-                                if (!record.enabled) Pill("已停用", c.faint) else Pill("生效中", c.success)
+                                Pill("生效中", c.success)
                             }
                             Spacer(Modifier.height(6.dp))
                             (record.promptSections + record.contexts).forEach { section ->

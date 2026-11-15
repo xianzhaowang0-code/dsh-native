@@ -57,7 +57,7 @@ object BundledPlugins {
             false
         }
         if (!created) return
-        val result = runCatching { runBlocking { store.installFile(zip) } }
+        val result = runCatching { runBlocking { store.installFile(zip, enabled = true) } }
             .getOrElse { PluginStore.Result(false, it.message ?: it.javaClass.simpleName) }
         zip.delete()
         Log.i(TAG, "内置插件 $id install ok=${result.ok} ${result.message}")

@@ -130,9 +130,10 @@ export function apply(ctx) {
 1. `plugin_dev_list`：看已装插件、工具/壳/loadings 登记与权限，确认是否升级同 id。
 2. `plugin_dev_scaffold`：`template` 可取 `tool`/`surface-shell`/`webview-shell`/`loading`；不覆盖已有目录。
 3. `plugin_dev_test`：隔离跑 apply，检查 `tools/shells/loadings/unsupported/missingServices` 与错误；这是试运行，不是功能验收。
-4. `plugin_dev_install` → `plugin_dev_enable`；改包后用 `plugin_dev_reload`。
+4. `plugin_dev_install`（新装**默认停用**）→ `plugin_dev_enable` 启用；改包后用 `plugin_dev_reload`。停用会清掉指向它的角色选择并静默回退内置。
 5. 真实调用：工具用 `plugin_dev_call` + 输入条/模型调用；页面点开插件窗口；整壳/加载页/回合/存储/提示词要用户在角色页选中后做冷启动或真实回合验证。
 6. `plugin_dev_test_shell` 只校验树/HTML 形状，不切当前壳，也不证明画面已验收。
+7. 卸载用 `plugin_dev_delete {id}`：正在使用/运行中会被拒绝（闸门 A），先 `plugin_dev_enable {enabled:false}` 停用再删；删除也会清角色选择并回退内置。
 
 没有工具时：zip 交付到「包管理 → 插件 → 导入 zip」，用插件详情的试运行/启用/重载/授权/页面入口。
 

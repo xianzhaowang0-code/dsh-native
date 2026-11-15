@@ -297,13 +297,18 @@ class PluginStore(private val context: Context) {
         }
     }
 
-    /** 从本地文件导入（调试通道 `--es dsh_plugin_zip` 无 UI 验收用；也方便以后接「最近下载」）。 */
-    suspend fun installFile(file: File): Result = withContext(Dispatchers.IO) {
+    /**
+     * 从本地文件导入（调试通道 `--es dsh_plugin_zip` 无 UI 验收用；也方便以后接「最近下载」）。
+     *
+     * [enabled] 为 null = 新装默认停用、覆盖安装保留原开关（0.3.4 导入语义）；
+     * 随包内置插件需要保持「装好即启用」时显式传 true。
+     */
+    suspend fun installFile(file: File, enabled: Boolean? = null): Result = withContext(Dispatchers.IO) {
         if (!file.isFile) return@withContext Result(false, "文件不存在：${file.absolutePath}")
         if (file.length() > MAX_IMPORT_BYTES) {
             return@withContext Result(false, "插件包太大（>${MAX_IMPORT_BYTES / 1024 / 1024}MB）")
         }
-        installFrom(file)
+        installFrom(file, enabled)
     }
 
     data class TestResult(
@@ -344,11 +349,11 @@ class PluginStore(private val context: Context) {
     }
 
     /** Directory installation still uses installFile, preserving schema/config/grant rules. */
-    suspend fun installDirectory(directory: File): Result = withContext(Dispatchers.IO) {
+    suspend fun installDirectory(directory: File, enabled: Boolean? = null): Result = withContext(Dispatchers.IO) {
         val archive = File(context.cacheDir, "plugin-directory-${java.util.UUID.randomUUID()}.zip")
         try {
             PluginDevPackage.pack(directory, archive)
-            installFile(archive)
+            installFile(archive, enabled)
         } catch (e: Exception) {
             Result(false, "目录安装失败：${e.message}")
         } finally {
@@ -359,13 +364,13 @@ class PluginStore(private val context: Context) {
 
     /** Parse and trial in staging before replacing the installed package. */
     @Synchronized
-    private fun installFrom(archive: File): Result = try {
-        installValidated(archive)
+    private fun installFrom(archive: File, enabled: Boolean? = null): Result = try {
+        installValidated(archive, enabled)
     } catch (e: Exception) {
         Result(false, "安装失败：${e.message ?: e.javaClass.simpleName}")
     }
 
-    private fun installValidated(archive: File): Result {
+    private fun installValidated(archive: File, enabled: Boolean?): Result {
         val read = PluginPackage.read(archive)
         if (read is ArchiveRead.Failed) return Result(false, read.error)
 
@@ -426,7 +431,10 @@ class PluginStore(private val context: Context) {
             path = transaction.target.absolutePath,
             main = manifest.main,
             format = manifest.format.label,
-            enabled = true,
+            // 0.3.4（用户 2026-11-15 第 5 条）：导入后默认**停用**，用户显式启用后才进「角色」。
+            // 覆盖安装/升级保留用户原来的开关（正在用的插件不会因为重装被悄悄关掉）；
+            // 随包内置插件（BundledPlugins）显式传 enabled = true，保持原有安装语义。
+            enabled = enabled ?: previous?.enabled ?: false,
             tools = run.tools.map { it.name },
             toolDescriptions = run.tools.associate { it.name to it.description },
             toolSchemas = run.tools.mapNotNull { tool -> tool.parameters?.let { tool.name to it } }.toMap(),
@@ -489,6 +497,11 @@ class PluginStore(private val context: Context) {
             else -> "；注册 ${run.tools.size} 个工具：" + run.tools.take(3).joinToString("、") { it.name }
         } + if (bundle != null && bundle.children.isNotEmpty()) {
             "；组合包 insert ${bundle.children.size} 个子插件"
+        } else {
+            ""
+        } + if (!record.enabled) {
+            // 0.3.4：新导入默认停用；明确告诉用户在插件页启用后才进角色。
+            "；默认停用（在插件页启用后才可选择角色）"
         } else {
             ""
         }

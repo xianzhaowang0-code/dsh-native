@@ -72,13 +72,27 @@ private fun NativeShellContent(vm: NativeShellHost, hostUi: NativeShellHostUi) {
     val scope = rememberCoroutineScope()
     val currentSub = NativePages.byId(subScreenName)
 
-    val openDrawer: () -> Unit = { scope.launch { drawerState.open() } }
-    val closeDrawer: () -> Unit = { scope.launch { drawerState.close() } }
     // 转场方向（M79）：同层级互跳（设置→会话列表）没有深度差，用这个记住是「进」还是「退」。
     var navForward by remember { mutableStateOf(true) }
-    // 一级页是从聊天页进的（记忆库/插件/任务…）还是从设置进的（会话列表…）：
-    // 用户 2026-11-12 第 4 条：从聊天页点「记忆」进记忆库，返回应该回聊天页，不该掉进设置。
-    var pageFromChat by rememberSaveable { mutableStateOf(false) }
+    // 0.3.4（用户第 3 条）：显式的「从哪进」状态，返回就回哪。
+    // backPage = 当前一级页/二级页的来路：null = 聊天，Settings = 设置首页，其它 = 对应一级页；
+    // backSub 只在来路本身是设置二级页时非空（例如在二级页打开抽屉后再导航）。
+    var backPage by rememberSaveable { mutableStateOf<String?>(null) }
+    var backSub by rememberSaveable { mutableStateOf<String?>(null) }
+    // 打开抽屉那一刻的路由快照（抽屉里的入口完成后按它返回）。
+    var drawerOriginPage by rememberSaveable { mutableStateOf<String?>(null) }
+    var drawerOriginSub by rememberSaveable { mutableStateOf<String?>(null) }
+    val openDrawer: () -> Unit = { scope.launch { drawerState.open() } }
+    val closeDrawer: () -> Unit = { scope.launch { drawerState.close() } }
+    // 0.3.4（用户第 3 条）：抽屉既可能由顶栏 ☰（openDrawer）打开，也可能被手势拉出——
+    // 手势走 ModalNavigationDrawer 内部、不经过 openDrawer 回调。所以在抽屉**真正打开**的
+    // 那一刻统一记来路，两种打开方式行为一致。
+    androidx.compose.runtime.LaunchedEffect(drawerState.isOpen) {
+        if (drawerState.isOpen) {
+            drawerOriginPage = screenName
+            drawerOriginSub = subScreenName
+        }
+    }
     val go: (String) -> Unit = { id ->
         // M84-B：页面由内置插件提供；被关掉时不进（入口已隐藏，这里防调试通道/旧状态残留）
         val target = NativePages.byId(id)
@@ -86,7 +100,9 @@ private fun NativeShellContent(vm: NativeShellHost, hostUi: NativeShellHostUi) {
             vm.builtinScreenEnabled(id)
         ) {
             navForward = true
-            pageFromChat = false
+            // 从设置页进的功能页：返回回设置（0.3.4 显式记录）
+            backPage = BuiltinPageIds.Settings
+            backSub = null
             screenName = id
             subScreenName = null
         }
@@ -98,18 +114,47 @@ private fun NativeShellContent(vm: NativeShellHost, hostUi: NativeShellHostUi) {
             vm.builtinScreenEnabled(id)
         ) {
             navForward = true
-            pageFromChat = true
+            backPage = null
+            backSub = null
             screenName = id
             subScreenName = null
         }
     }
-    /** 二级页统一从「设置」下挂；页面插件关掉时拒绝进入。 */
+    /** 二级页统一从「设置」下挂；页面插件关掉时拒绝进入。设置内部进二级页，返回仍回设置。 */
     val openSub: (String) -> Unit = { id ->
         val target = NativePages.byId(id)
         if (target != null && target.level == PageLevel.Secondary &&
             vm.builtinScreenEnabled(id)
         ) {
             navForward = true
+            backPage = BuiltinPageIds.Settings
+            backSub = null
+            screenName = BuiltinPageIds.Settings
+            subScreenName = id
+        }
+    }
+    /** 抽屉里点一级页：返回目标是打开抽屉时的来路（0.3.4 第 3 条）。 */
+    val goFromDrawer: (String) -> Unit = { id ->
+        val target = NativePages.byId(id)
+        if (target != null && target.level == PageLevel.Primary &&
+            vm.builtinScreenEnabled(id)
+        ) {
+            navForward = true
+            backPage = drawerOriginPage
+            backSub = drawerOriginSub
+            screenName = id
+            subScreenName = null
+        }
+    }
+    /** 抽屉里的二级入口（工作区管理 / 助手配置 / 远程 DSH…）：返回同样回抽屉来路，不绕经设置。 */
+    val openSubFromDrawer: (String) -> Unit = { id ->
+        val target = NativePages.byId(id)
+        if (target != null && target.level == PageLevel.Secondary &&
+            vm.builtinScreenEnabled(id)
+        ) {
+            navForward = true
+            backPage = drawerOriginPage
+            backSub = drawerOriginSub
             screenName = BuiltinPageIds.Settings
             subScreenName = id
         }
@@ -126,15 +171,17 @@ private fun NativeShellContent(vm: NativeShellHost, hostUi: NativeShellHostUi) {
         val sub = subScreenName ?: return@LaunchedEffect
         if (!vm.builtinScreenEnabled(sub)) subScreenName = null
     }
-    /** 功能页的返回：从聊天页来的回聊天，从设置来的回设置（M79）。 */
+    /** 返回：回到显式记录的来路（聊天 / 设置首页 / 对应一级页）。 */
     val backFromPage: () -> Unit = {
         navForward = false
-        if (pageFromChat) {
-            screenName = null
-        } else {
-            screenName = BuiltinPageIds.Settings
-        }
-        subScreenName = null
+        screenName = backPage
+        subScreenName = backSub
+    }
+    /** 二级页返回：同样回显式记录的来路（设置内部进二级页时来路就是设置）。 */
+    val closeSub: () -> Unit = {
+        navForward = false
+        screenName = backPage
+        subScreenName = backSub
     }
     // 宽屏（平板 / 折叠屏展开）侧边栏常驻：600dp 是 Material 的 compact/expanded 断点
     val wideLayout = androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp >= 600
@@ -159,10 +206,8 @@ private fun NativeShellContent(vm: NativeShellHost, hostUi: NativeShellHostUi) {
         navForward = false
         when {
             drawerState.isOpen -> closeDrawer()
-            currentSub != null -> subScreenName = null
-            // 功能页回到来路（M79：从聊天页进的回聊天，从设置进的回设置）
-            screenName == BuiltinPageIds.Workspace -> screenName = null
-            screenName == BuiltinPageIds.Settings -> screenName = null
+            currentSub != null -> closeSub()
+            // 功能页回到来路（0.3.4：聊天开的回聊天，设置开的回设置，抽屉开的回抽屉来路）
             screenName != null -> backFromPage()
             else -> vm.closeChat()
         }
@@ -179,10 +224,7 @@ private fun NativeShellContent(vm: NativeShellHost, hostUi: NativeShellHostUi) {
         go = go,
         goFromChat = goFromChat,
         openSub = openSub,
-        closeSub = {
-            navForward = false
-            subScreenName = null
-        },
+        closeSub = closeSub,
         backFromPage = backFromPage,
         settingsScroll = settingsScroll,
         wideLayout = wideLayout,
@@ -200,7 +242,8 @@ private fun NativeShellContent(vm: NativeShellHost, hostUi: NativeShellHostUi) {
             // 验收用：清回聊天落地页（关掉页面后测试「路由被拦」需要一个已知起点）
             screenName = null
             subScreenName = null
-            pageFromChat = false
+            backPage = null
+            backSub = null
         } else {
             val match = NativePages.find(requested)
             if (match != null) {
@@ -235,7 +278,7 @@ private fun NativeShellContent(vm: NativeShellHost, hostUi: NativeShellHostUi) {
                 onSwitchAssistant = { id -> vm.settings.setActiveAssistant(id) },
                 onManageAssistants = {
                     closeDrawer()
-                    openSub(BuiltinPageIds.Assistant)
+                    openSubFromDrawer(BuiltinPageIds.Assistant)
                 },
                 model = conversation.model,
                 toolCount = conversation.toolCount,
@@ -248,7 +291,7 @@ private fun NativeShellContent(vm: NativeShellHost, hostUi: NativeShellHostUi) {
                     subScreenName = null
                     closeDrawer()
                 },
-                onManageRemote = { closeDrawer(); openSub(BuiltinPageIds.RemoteDsh) },
+                onManageRemote = { closeDrawer(); openSubFromDrawer(BuiltinPageIds.RemoteDsh) },
                 badgeFor = { id -> conversation.sessions.firstOrNull { it.id == id }?.let { it.badge ?: if (it.running) xin.dshaa.ui.shellapi.chat.SessionBadge.RUNNING else null } },
                 onOpenSession = { summary ->
                     closeDrawer()
@@ -280,11 +323,11 @@ private fun NativeShellContent(vm: NativeShellHost, hostUi: NativeShellHostUi) {
                 },
                 onManageWorkspaces = {
                     closeDrawer()
-                    openSub(BuiltinPageIds.Workspaces)
+                    openSubFromDrawer(BuiltinPageIds.Workspaces)
                 },
                 onSelectScreen = { id ->
                     closeDrawer()
-                    go(id)
+                    goFromDrawer(id)
                 },
                 sessionsPageEnabled = conversation.isLocal && vm.builtinScreenEnabled(BuiltinPageIds.Sessions),
                 // M85-C3-4：抽屉「插件页面」段只读 page/v1 注册表；同 id 覆盖项走内置页入口，不重复列
@@ -359,7 +402,10 @@ private fun NativeShellContent(vm: NativeShellHost, hostUi: NativeShellHostUi) {
     } else {
         androidx.compose.material3.ModalNavigationDrawer(
             drawerState = drawerState,
-            gesturesEnabled = true,
+            // 0.3.4（用户第 2 条）：侧边栏手势只在聊天页与设置首页生效；二级页/其它一级页不认边缘滑动。
+            // 宽屏常驻抽屉不走这里，不受影响。
+            gesturesEnabled = subScreenName == null &&
+                (screenName == null || screenName == BuiltinPageIds.Settings),
             drawerContent = {
                 // Warm recreation in this host can leave the initial sheet at x=0 even
                 // with a correct closed offset. Keep measuring for anchors, but do not

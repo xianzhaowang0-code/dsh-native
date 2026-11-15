@@ -83,6 +83,7 @@ import xin.dshaa.ui.design.component.DshCard
 import xin.dshaa.ui.design.component.MiniChip
 import xin.dshaa.ui.design.component.SectionHeader
 import xin.dshaa.ui.design.theme.DshTheme2
+import xin.dshaa.ui.shellapi.visibleInRoleList
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -280,20 +281,25 @@ fun PluginsScreen(
                 2 -> {
                     fun roleMatches(role: String, label: String, id: String, provider: String) = matches(role, label, id, provider)
                     item {
-                        Text("启用后才可选择；停用当前提供方时会显示安全提示。", color = c.faint, style = MaterialTheme.typography.labelSmall)
+                        // 0.3.4（用户第 4 条）：停用/卸载的插件不再以「不可用」占位，也不再进计数。
+                        Text(
+                            "只列已启用且有授权的实现；停用当前提供方会自动回退内置并清空选择，这里不再显示。",
+                            color = c.faint,
+                            style = MaterialTheme.typography.labelSmall,
+                        )
                     }
-                    val shells = shellTargets.filter { roleMatches("界面 壳 shell", it.label, it.implementationId, it.provider + " " + it.pluginId.orEmpty()) }
+                    val shells = shellTargets.filter { it.visibleInRoleList() && roleMatches("界面 壳 shell", it.label, it.implementationId, it.provider + " " + it.pluginId.orEmpty()) }
                     if (shells.isNotEmpty() || query.isBlank()) item {
                         RoleTargetsSection("界面壳（${shells.size}）", "", shells, null,
                             shellTargets.firstOrNull { it.active }, "恢复原生界面", onSelectShell, onRestoreBuiltinShell)
                     }
-                    val loadings = loadingTargets.filter { roleMatches("启动 加载页 loading", it.label, it.implementationId, it.provider + " " + it.pluginId.orEmpty()) }
+                    val loadings = loadingTargets.filter { it.visibleInRoleList() && roleMatches("启动 加载页 loading", it.label, it.implementationId, it.provider + " " + it.pluginId.orEmpty()) }
                     if (loadings.isNotEmpty() || query.isBlank() || loadingSafetyNotice != null) item {
                         RoleTargetsSection("启动加载页（${loadings.size}）", "选择后下次启动生效", loadings,
                             loadingSafetyNotice, loadingTargets.firstOrNull { it.active }, "恢复默认加载页",
                             onSelectLoading, onRestoreBuiltinLoading)
                     }
-                    val agents = agentTargets.filter { roleMatches("回合 agent", it.label, it.agentId, it.provider + " " + it.pluginId.orEmpty()) }
+                    val agents = agentTargets.filter { it.visibleInRoleList() && roleMatches("回合 agent", it.label, it.agentId, it.provider + " " + it.pluginId.orEmpty()) }
                     if (agents.isNotEmpty() || query.isBlank() || agentSafetyNotice != null) item {
                         SectionHeader("回合（${agents.size}）")
                         agentSafetyNotice?.let { Text(it, color = c.danger, style = MaterialTheme.typography.labelSmall) }
@@ -308,7 +314,7 @@ fun PluginsScreen(
                         Triple("模型 model", modelTargets, null),
                     )
                     roles.forEachIndexed { index, (role, targets, safety) ->
-                        val filtered = targets.filter { roleMatches(role, it.label, it.implementationId, it.provider + " " + it.pluginId.orEmpty()) }
+                        val filtered = targets.filter { it.visibleInRoleList() && roleMatches(role, it.label, it.implementationId, it.provider + " " + it.pluginId.orEmpty()) }
                         if (filtered.isNotEmpty() || query.isBlank() || safety != null) item {
                             RoleTargetsSection(
                                 title = role.substringBefore(' ') + "（${filtered.size}）", hint = "", targets = filtered, safetyNotice = safety,
@@ -370,7 +376,8 @@ fun PluginsScreen(
             title = { Text("删除插件？", color = c.text) },
             text = {
                 Text(
-                    "会删掉 ${record.name} 的目录（files/plugins/${record.id}）。\n不影响会话、设置和内置插件。",
+                    "会删掉 ${record.name} 的目录（files/plugins/${record.id}）。\n" +
+                        "不影响会话和内置插件；如果它正在使用中，会先回退到内置实现并清空相关角色选择。",
                     style = MaterialTheme.typography.bodyMedium,
                     color = c.sub,
                 )

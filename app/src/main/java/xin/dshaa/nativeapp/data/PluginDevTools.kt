@@ -20,6 +20,12 @@ class PluginDevTools(
     private val onChanged: suspend () -> Unit,
     private val callTool: suspend (String, String, JsonObject, ToolContext) -> ToolResult = { _, _, _, _ -> ToolResult.err("工具测试未挂载") },
     private val testCapability: suspend (String, JsonObject) -> ToolResult = { _, _ -> ToolResult.err("能力测试未挂载") },
+    /** 0.3.4：停用后清角色选择（与 UI 开关同一条路径）；参数是插件 id。 */
+    private val onDisabled: suspend (String) -> Unit = {},
+    /** 0.3.4：删除插件（共享实现：清角色选择 + 常驻运行时 + 依赖重算）；force 只给 UI 用。 */
+    private val delete: suspend (String, Boolean) -> PluginStore.Result = { id, _ ->
+        PluginStore.Result(false, "删除通道未挂载：$id")
+    },
 ) {
     val tools: List<DshTool> = definitions.map { api -> object : DshTool {
         override val name = api.name
@@ -91,10 +97,24 @@ class PluginDevTools(
                 return result(installed)
             }
             "plugin_dev_enable" -> {
-                val changed = withContext(Dispatchers.IO) { store.setEnabled(string("id"), args.getValue("enabled").jsonPrimitive.boolean) }
-                if (!changed) return ToolResult.err("插件不存在：${string("id")}")
+                val id = string("id")
+                val enabled = args.getValue("enabled").jsonPrimitive.boolean
+                val changed = withContext(Dispatchers.IO) { store.setEnabled(id, enabled) }
+                if (!changed) return ToolResult.err("插件不存在：$id")
+                // 0.3.4（用户第 6 条）：停用正在使用的插件时静默回退内置并清选择，不留红字、不拦发送。
+                if (!enabled) onDisabled(id)
                 onChanged()
-                return ToolResult.ok("插件 ${string("id")}：${if (args.getValue("enabled").jsonPrimitive.boolean) "已启用" else "已停用"}")
+                return ToolResult.ok(
+                    "插件 $id：" + (if (enabled) "已启用" else "已停用（指向它的角色选择已回退内置）"),
+                )
+            }
+            // 0.3.4（用户第 7 条闸门 A）：默认拒绝删除正在使用/运行中的插件并返回原因；
+            // 模型先 plugin_dev_enable {enabled:false} 停用（会回退内置），停用后再删即可。
+            // UI 删除走确认弹窗，使用 AppViewModel.deletePlugin 的 force 路径，不经过这里。
+            "plugin_dev_delete" -> {
+                val id = string("id")
+                val deleted = delete(id, false)
+                return if (deleted.ok) ToolResult.ok(deleted.message) else ToolResult.err(deleted.message)
             }
             "plugin_dev_reload" -> {
                 val id = string("id")
@@ -135,8 +155,8 @@ class PluginDevTools(
     companion object {
         /** Only these may enter AppViewModel's read-only whitelist; all other names require normal write approval. */
         val readOnlyNames = setOf("plugin_dev_list", "plugin_dev_test")
-        val writeNames = setOf("plugin_dev_install", "plugin_dev_enable", "plugin_dev_reload", "plugin_dev_scaffold",
-            "plugin_dev_call", "plugin_dev_test_shell", "plugin_dev_test_capability")
+        val writeNames = setOf("plugin_dev_install", "plugin_dev_enable", "plugin_dev_delete", "plugin_dev_reload",
+            "plugin_dev_scaffold", "plugin_dev_call", "plugin_dev_test_shell", "plugin_dev_test_capability")
 
         /** Registration metadata only; no static text/tree, config, services or active-selection claim. */
         internal fun loadingMetadata(pluginId: String?, loadings: List<PluginLoading>): JsonArray = buildJsonArray {
@@ -155,7 +175,8 @@ class PluginDevTools(
             ApiTool("plugin_dev_list", "列出已安装插件的版本、开关、权限和工具/壳/加载页注册元数据；可按 id 查询，登记不等于选中。", schema("""{"id":{"type":"string","minLength":1}}""")),
             ApiTool("plugin_dev_test", "隔离试运行目录或 zip 的 apply，返回工具/壳/加载页登记和错误；不安装、不执行工具或验证冷启动画面。", schema("""{"path":{"type":"string","minLength":1,"description":"插件目录或 zip 路径，相对当前目录解析。"}}""", """["path"]""")),
             ApiTool("plugin_dev_install", "验证和试运行通过后安装插件目录或 zip；保留兼容配置，失败回滚旧包，不授危险权限或选择壳。", schema("""{"path":{"type":"string","minLength":1}}""", """["path"]""")),
-            ApiTool("plugin_dev_enable", "启用或停用已安装插件并刷新注册，不授予权限或选择壳。", schema("""{"id":{"type":"string","minLength":1},"enabled":{"type":"boolean"}}""", """["id","enabled"]""")),
+            ApiTool("plugin_dev_enable", "启用或停用已安装插件并刷新注册，不授予权限或选择壳；停用会自动回退内置角色。", schema("""{"id":{"type":"string","minLength":1},"enabled":{"type":"boolean"}}""", """["id","enabled"]""")),
+            ApiTool("plugin_dev_delete", "删除已安装插件并清掉指向它的角色选择；正在使用/运行中会被拒绝，请先用 plugin_dev_enable 停用。", schema("""{"id":{"type":"string","minLength":1}}""", """["id"]""")),
             ApiTool("plugin_dev_reload", "验证已安装插件后重新加载清单和注册，刷新现有插件。", schema("""{"id":{"type":"string","minLength":1}}""", """["id"]""")),
             ApiTool("plugin_dev_call", "执行已启用插件的一项工具，沿用其权限、参数校验和超时；可能产生真实效果。", schema("""{"id":{"type":"string","minLength":1},"tool":{"type":"string","minLength":1},"args":{"type":"object"}}""", """["id","tool"]""")),
             ApiTool("plugin_dev_test_shell", "在隔离运行时离屏挂载壳并可测试动作；宿主命令仅记录，验证树或 HTML，不切换当前界面。", schema("""{"id":{"type":"string","minLength":1},"shell":{"type":"string"},"action":{"type":"string"},"value":{"type":"object"}}""", """["id"]""")),

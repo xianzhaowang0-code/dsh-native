@@ -1,16 +1,19 @@
 package xin.dshaa.ui.design.component
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
@@ -26,6 +29,7 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.ExpandLess
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.Info
@@ -38,9 +42,14 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -258,6 +267,127 @@ fun SettingsSelectorRow(
                 overflow = TextOverflow.Ellipsis,
             )
             Icon(Icons.Rounded.KeyboardArrowDown, contentDescription = null, tint = c.brand)
+        }
+    }
+}
+
+/**
+ * 展开式选择行里的一个选项（0.3.4）。
+ *
+ * [value] 是写回设置的值；[description] 为空时只显示标题。
+ */
+data class SettingsOption(
+    val value: String,
+    val label: String,
+    val description: String = "",
+)
+
+/**
+ * 0.3.4（用户 2026-11-15 第 1 条）：点了真的会展开的选择行。
+ *
+ * [SettingsSelectorRow] 只画了向下的箭头，所有调用点却是「点一下循环切换」，看起来像下拉、
+ * 点开却展不开。这里点击展开内联选项列表（单选勾 + 说明），选中即收起；箭头随展开状态旋转，
+ * 展开/收起用 [AnimatedVisibility] 做高度 + 淡入淡出动画。
+ *
+ * 模型配置页那三个「点开弹窗」的选择器语义是对的，继续用 [SettingsSelectorRow]，不要改。
+ */
+@Composable
+fun SettingsExpandablePickerRow(
+    title: String,
+    subtitle: String,
+    value: String,
+    options: List<SettingsOption>,
+    onSelect: (String) -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+) {
+    val c = DshTheme2.colors
+    var expanded by remember { mutableStateOf(false) }
+    val currentLabel = options.firstOrNull { it.value == value }?.label ?: value
+    val arrowRotation by animateFloatAsState(
+        targetValue = if (expanded) 180f else 0f,
+        animationSpec = tween(180),
+        label = "settings-picker-arrow",
+    )
+    Surface(
+        modifier = modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)),
+        shape = RoundedCornerShape(10.dp),
+        color = c.surfaceAlt.copy(alpha = if (c.isDark) 0.55f else 0.75f),
+    ) {
+        Column {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable(enabled = enabled) { expanded = !expanded }
+                    .padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, color = c.text)
+                    Spacer(Modifier.height(2.dp))
+                    Text(subtitle, style = MaterialTheme.typography.bodySmall, color = c.sub)
+                }
+                Spacer(Modifier.width(12.dp))
+                Text(
+                    currentLabel,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = c.brandBright,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Icon(
+                    Icons.Rounded.KeyboardArrowDown,
+                    contentDescription = if (expanded) "收起" else "展开",
+                    tint = c.brand,
+                    modifier = Modifier.rotate(arrowRotation),
+                )
+            }
+            AnimatedVisibility(
+                visible = expanded,
+                enter = expandVertically(animationSpec = tween(200)) + fadeIn(animationSpec = tween(160)),
+                exit = shrinkVertically(animationSpec = tween(180)) + fadeOut(animationSpec = tween(120)),
+            ) {
+                Column(Modifier.padding(start = 16.dp, end = 16.dp, bottom = 12.dp)) {
+                    Box(Modifier.fillMaxWidth().height(1.dp).background(c.line.copy(alpha = 0.5f)))
+                    options.forEach { option ->
+                        val selected = option.value == value
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .padding(top = 2.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable(enabled = enabled) {
+                                    onSelect(option.value)
+                                    expanded = false
+                                }
+                                .padding(horizontal = 8.dp, vertical = 9.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    option.label,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                                    color = if (selected) c.brandBright else c.text,
+                                )
+                                if (option.description.isNotBlank()) {
+                                    Spacer(Modifier.height(1.dp))
+                                    Text(
+                                        option.description,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = c.sub,
+                                    )
+                                }
+                            }
+                            if (selected) {
+                                Spacer(Modifier.width(8.dp))
+                                Icon(Icons.Rounded.Check, contentDescription = "已选择", tint = c.brand, modifier = Modifier.size(18.dp))
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

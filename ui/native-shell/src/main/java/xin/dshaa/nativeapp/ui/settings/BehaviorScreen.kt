@@ -34,9 +34,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import xin.dshaa.ui.shellapi.data.SettingsStore
 import xin.dshaa.ui.design.component.SettingsCard
+import xin.dshaa.ui.design.component.SettingsExpandablePickerRow
 import xin.dshaa.ui.design.component.SettingsGroup
 import xin.dshaa.ui.design.component.SettingsInfoBanner
-import xin.dshaa.ui.design.component.SettingsSelectorRow
+import xin.dshaa.ui.design.component.SettingsOption
 import xin.dshaa.ui.design.component.SettingsSwitchRow
 import xin.dshaa.ui.design.theme.DshTheme2
 
@@ -81,18 +82,19 @@ fun BehaviorScreen(
                 )
             }
 
-            SettingsGroup(icon = Icons.Rounded.Visibility, title = "生成中发送") {
-                listOf(
-                    Triple("queue", "排队发送", "当前任务完成后，按顺序处理新消息"),
-                    Triple("steer", "插话发送", "在下一次安全边界交付补充，等待当前工具完成"),
-                ).forEach { (mode, title, description) ->
-                    SettingsSelectorRow(
-                        title = title,
-                        subtitle = description,
-                        value = if (settings.sendWhileRunningMode == mode) "已选择" else "",
-                        onClick = { settings.setSendWhileRunningMode(mode) },
-                    )
-                }
+            // 0.3.4（用户 2026-11-15 第 1 条）：之前两行各画一个下拉箭头，点一下却是开关切换。
+            // 现在合并成一行「发送方式」，点开在行内二选一；聊天页只有一个普通发送按钮，不加按钮。
+            SettingsGroup(icon = Icons.Rounded.Visibility, title = "发送方式") {
+                SettingsExpandablePickerRow(
+                    title = "生成中发送",
+                    subtitle = "当前任务还没结束时，新消息怎么交付",
+                    value = settings.sendWhileRunningMode,
+                    options = listOf(
+                        SettingsOption("queue", "排队发送", "当前任务完成后，按顺序处理新消息"),
+                        SettingsOption("steer", "插话发送", "在下一次安全边界交付补充，等待当前工具完成"),
+                    ),
+                    onSelect = { settings.setSendWhileRunningMode(it) },
+                )
             }
 
             // M79（用户 2026-11-12）：上下文自动压缩以前只有「窗口 × 0.8」写死、界面看不到，
@@ -140,11 +142,16 @@ fun BehaviorScreen(
                 )
             }
 
-            SettingsGroup(icon = Icons.Rounded.Security, title = "工具权限") {                SettingsSelectorRow(
+            SettingsGroup(icon = Icons.Rounded.Security, title = "工具权限") {
+                SettingsExpandablePickerRow(
                     title = "审批方式",
                     subtitle = "写类工具与命令执行",
-                    value = if (settings.approvalMode == "auto") "自动允许" else "每次询问",
-                    onClick = { settings.setApprovalMode(if (settings.approvalMode == "auto") "ask" else "auto") },
+                    value = settings.approvalMode,
+                    options = listOf(
+                        SettingsOption("ask", "每次询问", "write/edit/bash 首次调用会弹审批，可选「总是允许」"),
+                        SettingsOption("auto", "自动允许", "模型调用 write/edit/bash 不再弹窗，风险自负"),
+                    ),
+                    onSelect = { settings.setApprovalMode(it) },
                 )
                 SettingsInfoBanner(
                     if (settings.approvalMode == "auto") {
@@ -156,33 +163,25 @@ fun BehaviorScreen(
             }
 
             SettingsGroup(icon = Icons.Rounded.Palette, title = "主题") {
-                SettingsSelectorRow(
+                SettingsExpandablePickerRow(
                     title = "外观",
                     subtitle = "跟随系统 / 浅色 / 深色",
-                    value = when (settings.themeMode) {
-                        "light" -> "浅色"
-                        "dark" -> "深色"
-                        else -> "跟随系统"
-                    },
-                    onClick = {
-                        settings.setThemeMode(
-                            when (settings.themeMode) {
-                                "system" -> "light"
-                                "light" -> "dark"
-                                else -> "system"
-                            },
-                        )
-                    },
+                    value = settings.themeMode,
+                    options = listOf(
+                        SettingsOption("system", "跟随系统", "跟随手机的深色模式"),
+                        SettingsOption("light", "浅色", "始终使用浅色界面"),
+                        SettingsOption("dark", "深色", "始终使用深色界面"),
+                    ),
+                    onSelect = { settings.setThemeMode(it) },
                 )
-                SettingsSelectorRow(
+                SettingsExpandablePickerRow(
                     title = "强调色",
                     subtitle = "6 套预设（Operit 蓝 / 靛 / 青 / 紫 / 琥珀 / 玫瑰）",
-                    value = xin.dshaa.ui.design.theme.accentById(settings.accentId).name,
-                    onClick = {
-                        val list = xin.dshaa.ui.design.theme.DshAccents
-                        val index = list.indexOfFirst { it.id == settings.accentId }.coerceAtLeast(0)
-                        settings.setAccentId(list[(index + 1) % list.size].id)
+                    value = settings.accentId,
+                    options = xin.dshaa.ui.design.theme.DshAccents.map {
+                        SettingsOption(it.id, it.name)
                     },
+                    onSelect = { settings.setAccentId(it) },
                 )
             }
             Spacer(Modifier.height(24.dp))

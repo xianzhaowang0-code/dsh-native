@@ -189,6 +189,7 @@ import xin.dshaa.nativeapp.data.BackupManager
 import xin.dshaa.nativeapp.data.BundledSkills
 import xin.dshaa.nativeapp.data.PluginSessionStore
 import xin.dshaa.nativeapp.data.PluginStore
+import xin.dshaa.nativeapp.data.PluginRoleRefs
 import xin.dshaa.nativeapp.data.PluginToolRuntime
 import xin.dshaa.nativeapp.data.RoutingSessionStore
 import xin.dshaa.nativeapp.data.StorageUnavailableException
@@ -731,6 +732,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
         val result = capabilityHost.invoke(id, args.toString())
         if (result.ok) xin.dshaa.core.tools.ToolResult.ok(result.valueJson ?: "调用成功")
         else xin.dshaa.core.tools.ToolResult.err(result.error ?: "能力调用失败")
+    }, onDisabled = { id ->
+        // 0.3.4（用户第 5/6 条）：AI 停用插件也要清角色选择、静默回退内置——和 UI 开关同一条路径。
+        withContext(Dispatchers.Main) {
+            pluginsUi.firstOrNull { it.id == id }?.let { clearRoleSelection(it) }
+        }
+    }, delete = { id, force ->
+        deletePluginInternal(id, force)
     })
 
     private val registry: ToolRegistry =
@@ -6764,9 +6772,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
     }
 
     override fun setPluginEnabled(id: String, enabled: Boolean) {
+        val record = pluginsUi.firstOrNull { it.id == id }
         pluginStore.setEnabled(id, enabled)
         pluginsUi = pluginStore.list()
+        // 0.3.4（用户第 6 条）：停用正在使用的插件 → 静默回退内置/native/跟随协议 + 一次 notice；
+        // 不留红字、不拦发送；重新启用后也不会自动恢复旧选择（pref 已被清掉）。
+        val fallback = if (!enabled && record != null) clearRoleSelection(record) else emptyList()
         syncPluginTools()
+        val fallbackText = if (fallback.isNotEmpty()) "，已回退内置${fallback.joinToString("、")}" else ""
+        if (fallback.isNotEmpty()) pluginNotice = "已停用 ${record?.name ?: id}$fallbackText"
         // M83 服务容器：启用集合变了要重算依赖——关掉提供者后，依赖它的插件会变成
         // 「缺少服务 X」且不再注册工具；开回来恢复。apply 重跑放 IO 线程。
         viewModelScope.launch {
@@ -6775,9 +6789,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
             syncPluginTools()
             Log.i("DshPlugin", "services reconcile: reloaded=$reloaded missingPlugins=$missing")
             pluginNotice = if (missing > 0) {
-                "启用状态已更新：$missing 个插件缺少依赖服务（见插件详情）"
+                "启用状态已更新$fallbackText：$missing 个插件缺少依赖服务（见插件详情）"
             } else {
-                "启用状态已更新（重算 $reloaded 个插件的依赖）"
+                "启用状态已更新$fallbackText（重算 $reloaded 个插件的依赖）"
             }
         }
     }
@@ -6799,20 +6813,105 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
         }
     }
 
+    /**
+     * UI 删除插件（0.3.4）：确认弹窗已经在插件页点过，这里带 `force = true`；内部仍走共享实现，
+     * 所以角色选择、常驻运行时、工具注册、依赖重算都不会被绕过。
+     */
     override fun deletePlugin(id: String) {
-        val result = pluginStore.uninstall(id)
-        // M84-N：删掉插件时连它的投影 checkpoint 一起清（停用由 sync 清）。
-        pluginResidentRuntime.forget(id)
-        pluginsUi = pluginStore.list()
-        pluginNotice = result.message
-        syncPluginTools()
-        // M83：删掉提供者后，依赖它的插件要立刻变成「缺少服务 X」。
         viewModelScope.launch {
-            withContext(Dispatchers.IO) { pluginStore.reconcileServices() }
+            val result = deletePluginInternal(id, force = true)
+            if (!result.ok) pluginNotice = result.message
+        }
+    }
+
+    /**
+     * 0.3.4（用户第 5/7 条）：UI 与 AI 工具共用的删除实现。
+     *
+     * 闸门 A（用户第 7 条）：默认拒绝删除「正在使用 / 运行中」的插件并返回原因；模型可以先用
+     * `plugin_dev_enable {enabled:false}` 停用（停用会自动回退内置），再删。UI 确认弹窗后带
+     * [force] = true，内部先清角色选择（= 先回退内置）再删。
+     */
+    private suspend fun deletePluginInternal(id: String, force: Boolean): PluginStore.Result {
+        val record = withContext(Dispatchers.Main) { pluginsUi.firstOrNull { it.id == id } }
+            ?: withContext(Dispatchers.IO) { pluginStore.list().firstOrNull { it.id == id } }
+            ?: return PluginStore.Result(false, "插件不存在：$id")
+        val inUse = withContext(Dispatchers.Main) { pluginInUseReason(record) }
+        if (inUse != null && !force) {
+            return PluginStore.Result(
+                false,
+                "拒绝删除 $id：$inUse。先停用它（plugin_dev_enable {id, enabled:false}），" +
+                    "停用会自动回退内置角色，然后再删。",
+            )
+        }
+        // 先清选择（= 先回退内置）再删，避免删除后解析落到「未安装」的红字/拦发送。
+        val cleared = withContext(Dispatchers.Main) { clearRoleSelection(record) }
+        val result = withContext(Dispatchers.IO) { pluginStore.uninstall(id) }
+        withContext(Dispatchers.Main) {
+            // M84-N：删掉插件时连它的投影 checkpoint 一起清（停用由 sync 清）。
+            pluginResidentRuntime.forget(id)
+            pluginsUi = pluginStore.list()
+            syncPluginTools()
+            pluginNotice = result.message + if (cleared.isNotEmpty()) {
+                "，已回退内置${cleared.joinToString("、")}"
+            } else {
+                ""
+            }
+        }
+        // M83：删掉提供者后，依赖它的插件要立刻变成「缺少服务 X」。
+        withContext(Dispatchers.IO) { pluginStore.reconcileServices() }
+        withContext(Dispatchers.Main) {
             pluginsUi = pluginStore.list()
             syncPluginTools()
         }
+        return result
     }
+
+    /**
+     * 0.3.4（用户第 4 条 c / 第 6 条）：清掉指向 [record] 的角色选择，静默回退内置/native/跟随协议。
+     *
+     * 停用与删除共用，UI 与 AI 工具也共用；返回清掉的角色名，调用方合成一次 notice。
+     * 顺序按 [PluginRoleRefs.prefKeys]：界面壳 → 回合 → 存储 → 提示词 → 加载页。
+     */
+    private fun clearRoleSelection(record: PluginRecord): List<String> {
+        val cleared = ArrayList<String>()
+        for ((key, label) in PluginRoleRefs.rolesToClear(record) { prefs.getString(it, null) }) {
+            when (key) {
+                "dsh_shell" -> setActiveShell(null)
+                "dsh_agent" -> restoreBuiltinAgent()
+                "dsh_storage" -> restoreBuiltinStorage()
+                "dsh_prompt" -> restoreBuiltinPrompt()
+                "dsh_loading" -> restoreBuiltinLoading()
+            }
+            cleared += label
+        }
+        // 文档要求连调试模型通道键一起清；插件声明的模型通道被选中时回「跟随协议」。
+        val debugProvider = prefs.getString("debug_llm_provider", null)
+        if (PluginRoleRefs.providerReferences(record, debugProvider)) {
+            prefs.edit().remove("debug_llm_provider").apply()
+            cleared += "模型（调试）"
+        }
+        if (PluginRoleRefs.providerReferences(record, settings.llmProviderId)) {
+            restoreBuiltinModel()
+            cleared += "模型"
+        }
+        if (cleared.isNotEmpty()) {
+            Log.i("DshPlugin", "clear role selection for ${record.id}: ${cleared.joinToString("、")}")
+        }
+        return cleared
+    }
+
+    /** 0.3.4（用户第 7 条闸门 A）：删除前的「正在使用/运行中」判定；null = 可以删。 */
+    private fun pluginInUseReason(record: PluginRecord): String? = PluginRoleRefs.inUseReason(
+        record = record,
+        readPref = { prefs.getString(it, null) },
+        resident = pluginResidentRuntime.residencyIds().contains(record.id),
+        shellPluginId = shellActive?.pluginId,
+        agentPluginId = activeAgent?.pluginId,
+        storagePluginId = activeStorage?.pluginId,
+        promptPluginId = activePromptState?.pluginId,
+        loadingOwnerPlugin = loadingSnapshotStore.read()?.ownerPlugin,
+        modelProviderId = settings.llmProviderId,
+    )
 
     // ---- M67：内置 Operit 包（包管理 → 包） ----
 

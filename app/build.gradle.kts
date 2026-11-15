@@ -15,8 +15,8 @@ android {
         // showerclient / OperitTerminalCore 都是 minSdk 26（虚拟屏与 PTY 的最低要求）
         minSdk = 26
         targetSdk = 34
-        versionCode = 6
-        versionName = "0.3.3"
+        versionCode = 7
+        versionName = "0.3.4"
     }
 
     buildFeatures {
@@ -34,6 +34,24 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
+        }
+    }
+
+    /**
+     * 可选 ABI 分包（发布/测试用）：`-PabiSplits` 时额外产出 arm64-v8a 与 x86_64 两个单 ABI 包 + universal。
+     * 默认关闭：普通 `assembleDebug` 仍只产出一个 universal 包，不改变既有发布产物与路径。
+     *
+     * 注意：QuickJS/终端等原生库只有 arm64-v8a；x86_64 包只适合模拟器做界面/对话体验，
+     * 插件 JS、终端、proot 等原生能力不可用。
+     */
+    if (project.hasProperty("abiSplits")) {
+        splits {
+            abi {
+                isEnable = true
+                reset()
+                include("arm64-v8a", "x86_64")
+                isUniversalApk = true
+            }
         }
     }
 
