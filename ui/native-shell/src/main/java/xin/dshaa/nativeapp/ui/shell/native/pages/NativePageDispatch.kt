@@ -121,6 +121,7 @@ fun NativePageDispatch(
                     menuVisible = !nav.wideLayout,
                     onNewChat = { conversation.newChat() },
                     onOpenWorkspace = { nav.goFromChat(BuiltinPageIds.Workspace) },
+                    workspacePath = vm.workspacePath,
                     onAttachImage = { uri -> vm.attachImage(uri, target = current) },
                     onAttachPhoto = { file -> vm.attachPhoto(file, target = current) },
                     onCaptureScreenshot = { vm.attachScreenshot(target = current) },

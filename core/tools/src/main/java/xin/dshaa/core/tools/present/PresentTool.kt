@@ -12,7 +12,7 @@ import xin.dshaa.core.tools.resolvePath
 
 /**
  * `present`：把已有的文件声明为交付物（最多 4 个）。
- * 工具本身只校验路径、返回文本；卡片由 UI 从参数渲染（见 ChatScreen.PresentedCard）。
+ * 工具本身只校验路径、返回文本；卡片由 UI 从参数渲染（见 `ui:native-shell` 的 ChatScreen.PresentedCard）。
  */
 class PresentTool : DshTool {
     override val name = "present"
