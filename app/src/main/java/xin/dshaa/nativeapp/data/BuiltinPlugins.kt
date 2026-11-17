@@ -94,9 +94,17 @@ object BuiltinPlugins {
         BuiltinPlugin(
             id = "builtin.plugin.dev",
             name = "插件开发",
-            description = "供 AI 生成、试运行、安装、启停与测试插件；变更仍走工具审批，权限沿用插件清单",
-            tools = setOf("plugin_dev_list", "plugin_dev_test", "plugin_dev_install", "plugin_dev_enable",
-                "plugin_dev_reload", "plugin_dev_scaffold", "plugin_dev_call", "plugin_dev_test_shell", "plugin_dev_test_capability"),
+            description = "供 AI 生成、试运行、安装、启停、测试与全控制插件（授予/撤销权限、改配置、选角色、中间件总开关）；" +
+                "变更仍走工具审批，权限沿用插件清单",
+            tools = setOf(
+                "plugin_dev_list", "plugin_dev_test", "plugin_dev_install", "plugin_dev_enable",
+                "plugin_dev_reload", "plugin_dev_delete", "plugin_dev_scaffold", "plugin_dev_call",
+                "plugin_dev_test_shell", "plugin_dev_test_capability",
+                // M88-E：AI 全控制插件也归本组——关掉「插件开发」后这四个工具一并从 registry 注销。
+                "plugin_dev_grant", "plugin_dev_revoke", "plugin_dev_config", "plugin_dev_role",
+                // M88-I：中间件总开关与状态查询同组。
+                "plugin_dev_middleware", "plugin_dev_middleware_state",
+            ),
         ),
         BuiltinPlugin(
             id = "builtin.fs",
@@ -126,8 +134,8 @@ object BuiltinPlugins {
         BuiltinPlugin(
             id = "builtin.web",
             name = "联网",
-            description = "web_search / web_fetch：搜索与抓网页",
-            tools = setOf("web_search", "web_fetch"),
+            description = "web_search / web_fetch / http_request：搜索、抓网页、发 HTTP 请求（只允许 http/https）",
+            tools = setOf("web_search", "web_fetch", "http_request"),
         ),
         BuiltinPlugin(
             id = "builtin.agent",
@@ -159,6 +167,12 @@ object BuiltinPlugins {
             name = "交互",
             description = "ask_user_question / present：向用户提问与展示成品",
             tools = setOf("ask_user_question", "present"),
+        ),
+        BuiltinPlugin(
+            id = "builtin.capability",
+            name = "能力与通知",
+            description = "capability / notify：调用内置与插件能力、发系统通知（通知需要系统权限；关掉后模型看不到这两个工具）",
+            tools = setOf("capability", "notify"),
         ),
         BuiltinPlugin(
             id = "builtin.todo",
@@ -313,9 +327,8 @@ class BuiltinPluginStore(context: Context) {
 
     fun isEnabled(id: String): Boolean {
         val plugin = BuiltinPlugins.byId(id) ?: return false
-        val off = disabled()
         // 默认开的记录在「关掉的集合」里；默认关的（以后会有）记在同一个集合里表示「显式打开」。
-        return if (plugin.defaultEnabled) id !in off else id in off
+        return enabledFor(plugin.defaultEnabled, disabled(), id)
     }
 
     fun setEnabled(id: String, enabled: Boolean) {
@@ -349,7 +362,14 @@ class BuiltinPluginStore(context: Context) {
 
     fun ui(): List<BuiltinPluginUi> = BuiltinPlugins.all.map { BuiltinPluginUi(it, isEnabled(it.id)) }
 
-    private companion object {
-        const val KEY = "builtin_plugins_disabled"
+    companion object {
+        private const val KEY = "builtin_plugins_disabled"
+
+        /**
+         * M88-C：纯函数开关判定（JVM 可测）。
+         * 默认开的组：不在「关掉集合」= 开；默认关的组：在集合里 = 显式打开。
+         */
+        internal fun enabledFor(defaultEnabled: Boolean, disabled: Set<String>, id: String): Boolean =
+            if (defaultEnabled) id !in disabled else id in disabled
     }
 }

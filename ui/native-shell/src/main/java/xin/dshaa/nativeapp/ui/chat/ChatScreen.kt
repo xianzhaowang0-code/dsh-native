@@ -143,6 +143,7 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import xin.dshaa.nativeapp.ui.shell.slots.SlotDock
 import xin.dshaa.core.model.BlockType
 import xin.dshaa.core.model.ChatMessage
 import xin.dshaa.core.model.ContentBlock
@@ -164,7 +165,10 @@ import xin.dshaa.ui.shellapi.chat.ChatSessionState
 import xin.dshaa.ui.shellapi.chat.PendingApproval
 import xin.dshaa.ui.shellapi.chat.PendingImage
 import xin.dshaa.ui.shellapi.chat.READ_ONLY_SUBAGENT
+import xin.dshaa.ui.shellapi.chat.TruncationKind
 import xin.dshaa.ui.shellapi.chat.WaitingSession
+import xin.dshaa.ui.shellapi.chat.toolResultLooksFailed
+import xin.dshaa.ui.shellapi.chat.truncationResumeNotice
 import xin.dshaa.ui.shellapi.BuiltinPageIds
 import xin.dshaa.ui.shellapi.ChatUiCapabilities
 import xin.dshaa.ui.design.component.DshAvatar
@@ -235,6 +239,10 @@ fun ChatScreen(
     /** 发送入口（M21）：整行先交给 ViewModel 解析斜杠命令；返回 true = 已接受，可清空输入。 */
     onSubmit: (String) -> Boolean,
     onStop: () -> Unit,
+    /** H1：上一轮被 max_tokens 截断时点「继续生成」（点一次消费一次）。 */
+    onContinueTruncated: () -> Unit = {},
+    /** H1：单轮输出上限，只用于截断说明文案（0 = 不显示具体数值）。 */
+    outputTokenLimit: Int = 0,
     onApproval: (allow: Boolean, always: Boolean) -> Unit,
     onAnswer: (List<xin.dshaa.core.tools.AskAnswer>) -> Unit,
     /** 计划模式（M18）：状态来自 `PlanModeState` 的镜像；pending 非空 = 下一步生效。 */
@@ -988,6 +996,19 @@ fun ChatScreen(
         // 斜杠命令结果（M21）：上游命令的「分离结果 notice」，不写聊天正文
         state.commandNotice?.let { notice ->
             CommandNoticeBar(notice, onDismissCommandNotice)
+        }
+
+        // H1（docs/182）：上一轮被 max_tokens 截断 → 可行动的「继续生成」入口。
+        // 流式中不显示（新一轮已经开始）；只读会话不给；冷启/切会话由宿主回填 pendingContinue。
+        if (!state.readOnly && !state.streaming) {
+            state.pendingContinue?.let { kind ->
+                TruncationResumeBar(
+                    kind = kind,
+                    outputTokenLimit = outputTokenLimit,
+                    queuedMessages = state.queuedPrompts.isNotEmpty(),
+                    onContinue = onContinueTruncated,
+                )
+            }
         }
 
         // 输入触发面板（M21）：`/` 命令 + 技能，`@` 工作区文件/目录
@@ -1925,8 +1946,50 @@ private fun CommandNoticeBar(text: String, onDismiss: () -> Unit) {
     }
 }
 
-/** 只读会话的底部说明（旧版导入副本 / 子代理会话回放 / 只读存储插件），替代输入条。 */
+/**
+ * H1（docs/182）：截断后的「继续生成」卡片。
+ *
+ * 为什么放在输入条上方而不是某条消息下面：错误正文不落会话 JSONL，冷启后 assistant 消息上
+ * 没有 error；待续状态由宿主按会话 id 持久化并回填 [ChatSessionState.pendingContinue]，
+ * 所以卡片必须只依赖这个状态（消息在不在、有没有 error 都不影响）。
+ */
 @Composable
+private fun TruncationResumeBar(
+    kind: TruncationKind,
+    outputTokenLimit: Int,
+    queuedMessages: Boolean,
+    onContinue: () -> Unit,
+) {
+    val c = DshTheme2.colors
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp)
+            .padding(top = 4.dp),
+        shape = RoundedCornerShape(12.dp),
+        color = c.surfaceAlt,
+        border = BorderStroke(1.dp, c.danger.copy(alpha = 0.25f)),
+    ) {
+        Row(
+            Modifier.padding(start = 12.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(Icons.Rounded.ErrorOutline, null, tint = c.danger, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(8.dp))
+            Text(
+                truncationResumeNotice(kind, outputTokenLimit, queuedMessages),
+                style = MaterialTheme.typography.labelMedium,
+                color = c.text,
+                modifier = Modifier.weight(1f),
+            )
+            TextButton(onClick = onContinue) {
+                Text("继续生成", color = c.brand, fontWeight = FontWeight.Medium)
+            }
+        }
+    }
+}
+
+/** 只读会话的底部说明（旧版导入副本 / 子代理会话回放 / 只读存储插件），替代输入条。 */@Composable
 private fun ReadOnlyInputNotice(reason: String?) {
     val c = DshTheme2.colors
     val subagent = reason == READ_ONLY_SUBAGENT
@@ -2293,6 +2356,8 @@ private fun MessageMenuDialog(
                     }
                 }
                 MenuRow("信息", Icons.Rounded.Info, onClick = onInfo)
+                // M87-D：插件消息操作项（`chat.message.actions`）；空注册表时菜单保持原样。
+                SlotDock("chat.message.actions", horizontalPadding = 0, verticalPadding = 0)
             }
         }
     }
@@ -2475,6 +2540,8 @@ private fun UserMessage(
         }
         Spacer(Modifier.height(4.dp))
         Text(formatMessageTime(message.createdAt), style = MaterialTheme.typography.labelSmall, color = c.faint)
+        // M87-D：用户消息附加行（插件 `chat.node.user`）；按内容宽度靠右，跟气泡对齐。
+        SlotDock("chat.node.user", horizontalPadding = 0, verticalPadding = 2, fillWidth = false)
         previewPath?.let { path -> ImagePreviewDialog(path = path, onDismiss = { previewPath = null }) }
     }
 }
@@ -2665,6 +2732,8 @@ private fun AssistantTurn(
                 }
             }
         }
+        // M87-D：助手回合 footer 附加行（插件 `chat.node.assistant`），每轮一条。
+        SlotDock("chat.node.assistant", horizontalPadding = 0, verticalPadding = 2)
     }
 }
 
@@ -3202,8 +3271,8 @@ private fun ToolCallCard(
     var previewPath by remember { mutableStateOf<String?>(null) }
     val resultText = result?.content?.filter { it.type == BlockType.TEXT }?.joinToString("") { it.text }.orEmpty()
     val images = result?.content?.filter { it.type == BlockType.IMAGE }.orEmpty()
-    val failed = resultText.startsWith("User denied") || resultText.contains("not found", true) ||
-        resultText.startsWith("<error>") || resultText.contains("error:", true)
+    // M87-A / H1：失败态规则集中到 shell-api（插件拒绝、max_tokens 截断不执行等），避免漏判。
+    val failed = toolResultLooksFailed(resultText)
     // M22：工具结果里能拿到 id 的「活对象」给一个跳转入口（子代理会话 / 后台任务面板）。
     val subagentId = if (name == "subagent" || name == "subagent_fork") {
         Regex("^started subagent (\\S+)").find(resultText)?.groupValues?.get(1)
@@ -3257,6 +3326,19 @@ private fun ToolCallCard(
                     modifier = Modifier.size(17.dp),
                 )
             }
+            // M87-A：插件改写了这次工具结果 → 明确标出改写者与原始哈希（证据不因改写失真）。
+            result?.sourceSummary?.takeIf { it.startsWith("已由 ") }?.let { rewrite ->
+                Row(
+                    Modifier.padding(start = 12.dp, end = 12.dp, bottom = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Rounded.Info, null, tint = c.warn, modifier = Modifier.size(13.dp))
+                    Spacer(Modifier.width(5.dp))
+                    Text(rewrite, style = MaterialTheme.typography.labelSmall, color = c.warn)
+                }
+            }
+            // M87-C：工具卡 body 的插件附加行（chat.node.tool）。
+            SlotDock("chat.node.tool", horizontalPadding = 12, verticalPadding = 0)
             // ask_user_question 的结果直接摊开：用户点完选项，聊天里要能一眼看到「刚才选的是哪个」，
             // 而不是去展开原始 JSON 找。格式来自 AskUserQuestionTool（`- [id] 问题` + `→ 答案`）。
             if (name == "ask_user_question" && resultText.isNotBlank()) {
@@ -3532,7 +3614,12 @@ private fun ApprovalDialog(
                 )
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    "工具在 App 工作区里执行；bash 不受工作区限制，请确认命令安全。",
+                    // 只有 bash 真的不受工作区限制；其它工具不能再跟着写这句（M88-I 收口）。
+                    if (approval.toolName == "bash") {
+                        "工具在 App 工作区里执行；bash 不受工作区限制，请确认命令安全。"
+                    } else {
+                        "工具在 App 工作区里执行，请确认参数与操作安全。"
+                    },
                     style = MaterialTheme.typography.labelSmall,
                     color = c.faint,
                 )

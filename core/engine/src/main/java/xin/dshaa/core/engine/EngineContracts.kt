@@ -289,4 +289,18 @@ class EngineDeps(
     val nextQueuedInput: suspend () -> TurnInput? = { null },
     /** Called only after user/message(promptId) is durable. Failures propagate; recover by promptId. */
     val onInputDelivered: suspend (promptId: String, seq: Long) -> Unit = { _, _ -> },
+    /**
+     * M87-A（docs/181 §3.2）：工具中间件链。默认空链 = 与 0.3.4 逐字节相同（零开销）。
+     *
+     * 传 lambda 而不是链本身：插件启用/停用/重载只重建 [ToolMiddlewareChain] 快照，
+     * 已经在跑的会话下一次请求/工具调用就能拿到新链（不必重建 TurnEngine）。
+     */
+    val toolMiddleware: () -> ToolMiddlewareChain = { ToolMiddlewareChain.EMPTY },
+    /**
+     * M87-B（docs/181 §3.3）：请求/提示词中间件链。默认空链 = 与 0.3.4 逐字节相同（零开销）。
+     *
+     * 与 [toolMiddleware] 同一热换语义：插件启用/停用/重载只重建 [RequestMiddlewareChain]
+     * 快照，下一次请求/流式增量就拿到新链（不必重建 TurnEngine）。
+     */
+    val requestMiddleware: () -> RequestMiddlewareChain = { RequestMiddlewareChain.EMPTY },
 )

@@ -27,6 +27,8 @@ class DshApplication : Application() {
         super.onCreate()
         ShowerEnvironment.shellRunner = DeviceShell
         DeviceShell.initShizuku(this)
+        // H7：root 探测放后台（su 授权弹窗可能等十几秒），能力页/终端读缓存。
+        DeviceShell.primeRootProbe()
         A11y.isReady()
         ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
             override fun onStart(owner: LifecycleOwner) {

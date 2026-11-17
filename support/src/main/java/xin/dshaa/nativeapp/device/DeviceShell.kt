@@ -28,26 +28,104 @@ object DeviceShell : ShellRunner {
 
     private const val TAG = "DeviceShell"
 
+    /** 单次 `su` 探测超时：Magisk 首次会弹授权框，给用户 12 秒点。 */
+    private const val ROOT_PROBE_TIMEOUT_SECONDS = 12L
+
     @Volatile
     var shizukuReady: Boolean = false
         private set
 
     @Volatile
-    private var rootChecked = false
+    private var rootProbeCache: RootProbeResult? = null
 
-    @Volatile
-    private var rootReady = false
+    private val rootProbeLock = Any()
 
-    fun hasRoot(): Boolean {
-        if (!rootChecked) {
-            rootChecked = true
-            rootReady = runCatching {
-                val process = ProcessBuilder("su", "-c", "id").redirectErrorStream(true).start()
-                val output = process.inputStream.bufferedReader().readText()
-                process.waitFor(3, TimeUnit.SECONDS) && output.contains("uid=0")
-            }.getOrDefault(false)
+    /** 探测 root（首次会阻塞；UI 用 [shellStatus]/[primeRootProbe] 别在主线程序列化等）。 */
+    fun probeRoot(force: Boolean = false): RootProbeResult {
+        if (!force) rootProbeCache?.let { return it }
+        synchronized(rootProbeLock) {
+            if (!force) rootProbeCache?.let { return it }
+            val result = RootProbe.probe(::runSuProbe)
+            rootProbeCache = result
+            Log.i(TAG, "root probe available=${result.available} command=${result.command} waiting=${result.waiting}")
+            return result
         }
-        return rootReady
+    }
+
+    /** 非阻塞读缓存：null = 还没探测过。 */
+    fun rootAvailableCached(): Boolean? = rootProbeCache?.available
+
+    fun hasRoot(): Boolean = probeRoot().available
+
+    /** App 启动时后台探一次，避免首次进能力页/终端时主线程卡在 su 上。 */
+    fun primeRootProbe() {
+        if (rootProbeCache != null) return
+        Thread({ runCatching { probeRoot() } }, "root-probe").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    /** H7：设置 →「权限与能力」的 Shell 身份行。 */
+    fun shellStatus(): ShellStatus {
+        val probe = probeRoot()
+        val binderReady = shizukuReady
+        val permission = hasShizukuPermission()
+        return RootProbe.status(
+            root = probe.available,
+            rootCommand = probe.command,
+            shizuku = binderReady,
+            shizukuPermission = permission,
+            rootReason = probe.reason,
+        )
+    }
+
+    /** 检测一次的进程执行器：stdout/stderr 分读，超时立刻销毁（授权弹窗会走这里）。 */
+    private fun runSuProbe(argv: List<String>): SuOutput? = runCatching {
+        val process = ProcessBuilder(argv).redirectErrorStream(false).start()
+        val out = StringBuilder()
+        val err = StringBuilder()
+        val outThread = Thread {
+            runCatching { out.append(process.inputStream.bufferedReader().readText()) }
+        }.apply { isDaemon = true; start() }
+        val errThread = Thread {
+            runCatching { err.append(process.errorStream.bufferedReader().readText()) }
+        }.apply { isDaemon = true; start() }
+        val finished = process.waitFor(ROOT_PROBE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        if (!finished) process.destroyForcibly()
+        outThread.join(1_500)
+        errThread.join(1_500)
+        SuOutput(
+            stdout = out.toString(),
+            stderr = err.toString(),
+            exitCode = if (finished) runCatching { process.exitValue() }.getOrDefault(-1) else -1,
+            timedOut = !finished,
+        )
+    }.getOrNull()
+
+    /**
+     * M88-B（docs/183 §2）：`shell.exec` 的唯一执行入口 —— **root → Shizuku → App** 自动选择。
+     *
+     * 有 root 用 root；没有 root 自动退到 Shizuku；都没有用 App 自己的 `sh`。
+     * 需要 root 的命令在无 root 时由命令的 stderr 体现失败；返回的 `identity` 说清实际身份，
+     * **不假装 root**。`root.exec` 已并入本能力（按 id 直调返回 `merged_into_shell_exec`）。
+     */
+    suspend fun runElevated(command: String): ShellCommandResult = withContext(Dispatchers.IO) {
+        when {
+            hasRoot() -> runRoot(command)
+            hasShizuku() -> runShizuku(command)
+            else -> runApp(command)
+        }
+    }
+
+    /** `shell.exec` 实际用的身份：root > 已授权 Shizuku > App（与 [runElevated] 的顺序一致）。 */
+    fun elevatedIdentity(): String {
+        val probe = probeRoot()
+        return ShellCapability.execIdentity(
+            root = probe.available,
+            shizuku = shizukuReady,
+            shizukuPermission = hasShizukuPermission(),
+        )
     }
 
     /** binder 收到 + 权限已授予才算「Shizuku 可用」（只收到 binder 时命令仍会被拒）。 */

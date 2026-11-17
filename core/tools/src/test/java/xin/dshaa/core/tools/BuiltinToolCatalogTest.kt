@@ -14,8 +14,9 @@ class BuiltinToolCatalogTest {
     )
 
     @Test
-    fun catalogCoversThirtyTwoToolsWithoutDuplicates() {
-        assertEquals(32, BuiltinToolCatalog.allTools().size)
+    fun catalogCoversThirtyThreeToolsWithoutDuplicates() {
+        // M88-D：builtin.web 增加 http_request（32 → 33）。
+        assertEquals(33, BuiltinToolCatalog.allTools().size)
         assertEquals(emptyList(), BuiltinToolCatalog.duplicateTools())
     }
 

@@ -13,9 +13,18 @@ import xin.dshaa.core.js.JsStatus
 import xin.dshaa.core.js.QuickJs
 import xin.dshaa.core.plugins.ArchiveRead
 import xin.dshaa.core.plugins.BundlePatchParser
+import xin.dshaa.core.plugins.ContributionKind
+import xin.dshaa.core.plugins.IrRead
 import xin.dshaa.core.plugins.ManifestRead
+import xin.dshaa.core.plugins.PackageFormat
+import xin.dshaa.core.plugins.PackageImport
+import xin.dshaa.core.plugins.PackageImporter
+import xin.dshaa.core.plugins.PackageIr
+import xin.dshaa.core.plugins.PackageIrCodec
 import xin.dshaa.core.plugins.PackageParse
+import xin.dshaa.core.plugins.PluginContribution
 import xin.dshaa.core.plugins.PluginDryRun
+import xin.dshaa.core.plugins.PluginManifest
 import xin.dshaa.core.plugins.PluginModule
 import xin.dshaa.core.plugins.PluginPackage
 import xin.dshaa.core.plugins.PluginPermissions
@@ -137,8 +146,39 @@ class PluginStore(private val context: Context) {
         return Result(true, "已允许 ${record.name}：${grants.joinToString("、")}")
     }
 
-    /** 删除插件目录 + 清单记录。返回给用户看的文案。 */
+    /**
+     * M88-E（docs/183 §5）：AI 授予权限的统一写入口。
+     *
+     * [raw] 里的清单外/未实现权限由 `sanitizeGrants` 直接丢弃（不报错、不假装授予）；
+     * 自动允许的权限（fs:workspace / ui）也允许写进来，但语义上它们本来就不需要确认。
+     */
     @Synchronized
+    fun grantMany(id: String, raw: List<String>): Result {
+        val record = registry.find(id) ?: return Result(false, "这个插件不在清单里")
+        val requested = PluginPermissions.parseAll(record.permissions)
+        val sanitized = PluginPermissions.sanitizeGrants(requested, record.grantedPermissions + raw)
+        registry.upsert(record.copy(grantedPermissions = sanitized.toList()))
+        return Result(
+            true,
+            "已允许 ${record.name}：" + sanitized.joinToString("、").ifEmpty { "（清单里没有可授予的权限）" },
+        )
+    }
+
+    /** M88-E：撤销若干权限；清单外的名字当作没授予过（不报错）。 */
+    @Synchronized
+    fun revokeGrants(id: String, raw: List<String>): Result {
+        val record = registry.find(id) ?: return Result(false, "这个插件不在清单里")
+        val drop = PluginPermissions.parseAll(raw).map { it.raw }.toSet()
+        val next = record.grantedPermissions.filterNot { it in drop }
+        registry.upsert(record.copy(grantedPermissions = next))
+        val removed = record.grantedPermissions.filter { it in drop }
+        return Result(
+            true,
+            "已撤销 ${record.name}：" + removed.joinToString("、").ifEmpty { "（本来就没授予这些权限）" },
+        )
+    }
+
+    /** 删除插件目录 + 清单记录。返回给用户看的文案。 */    @Synchronized
     fun uninstall(id: String): Result {
         val record = registry.remove(id) ?: return Result(false, "这个插件不在清单里")
         val removed = runCatching { File(record.path).deleteRecursively() }.getOrDefault(false)
@@ -201,6 +241,10 @@ class PluginStore(private val context: Context) {
             registry.upsert(record.copy(error = text))
             return Result(false, text)
         }
+        // M87-G：声明式包没有 JS 入口，重载只重读 dsh.package.json，不跑 QuickJS。
+        if (record.main.isBlank() && record.contributions.none { it.kind == ContributionKind.SCRIPT }) {
+            return reloadDeclarative(record, dir)
+        }
         val manifest = when (val read = PluginPackage.readManifest(dir)) {
             is ManifestRead.Ok -> read.manifest
             ManifestRead.Missing -> null
@@ -259,10 +303,14 @@ class PluginStore(private val context: Context) {
                 projections = run.projections,
                 shells = run.shells,
                 loadings = run.loadings,
+                slots = run.slots,
                 agents = run.agents,
                 storages = run.storages,
                 prompts = run.prompts,
                 capabilities = run.capabilities,
+                toolMiddleware = run.toolMiddleware,
+                llmMiddleware = run.llmMiddleware,
+                storageHooks = run.storageHooks,
                 unsupported = run.unsupported,
                 provides = run.provides,
                 injects = run.injects,
@@ -324,14 +372,22 @@ class PluginStore(private val context: Context) {
         try {
             check(scratch.mkdirs()) { "建不了试运行目录" }
             val archive = if (path.isDirectory) File(scratch, "package.zip").also { PluginDevPackage.pack(path, it) } else path
-            val read = PluginPackage.read(archive)
-            if (read is ArchiveRead.Failed) return@withContext TestResult(false, read.error)
-            val parsed = PluginPackage.parse((read as ArchiveRead.Ok).files)
-            if (parsed is PackageParse.Failed) return@withContext TestResult(false, parsed.error)
-            parsed as PackageParse.Ok
+            val imported = PackageImporter.importFile(archive)
+            if (imported is PackageImport.Failed) return@withContext TestResult(false, imported.error)
+            imported as PackageImport.Ok
             val dir = File(scratch, "package").apply { check(mkdir()) }
-            writeFiles(dir, wrappedFiles(parsed))
-            val manifest = parsed.manifest
+            val manifest = imported.manifest
+            if (manifest == null) {
+                // M87-G：声明式包没有 JS 入口，试运行只做 IR 校验/落盘；带 script/client 的同 install 一样拒绝。
+                if (imported.ir.hasRuntimeScript()) {
+                    return@withContext TestResult(false, "声明式包里的 script/client 贡献物本版还不能执行（用 DSH package.json + main）", imported.ir.id)
+                }
+                writeFiles(dir, imported.files)
+                val kinds = imported.ir.contributions.groupingBy { it.kind.id }.eachCount()
+                    .entries.joinToString("、") { "${it.key}×${it.value}" }
+                return@withContext TestResult(true, "声明式包（$kinds）：不需要 JS 试运行", imported.ir.id)
+            }
+            writeFiles(dir, wrappedFiles(manifest, imported.files))
             val run = dryRunForConfig(
                 File(dir, manifest.main), manifest.main, manifest.format.label, dir.absolutePath,
                 "{}", manifest.configDefaults?.toString() ?: "{}",
@@ -371,14 +427,16 @@ class PluginStore(private val context: Context) {
     }
 
     private fun installValidated(archive: File, enabled: Boolean?): Result {
-        val read = PluginPackage.read(archive)
-        if (read is ArchiveRead.Failed) return Result(false, read.error)
+        // M87-G：多格式导入统一走 PackageImporter（zip / .dshpkg / 单 .md / 单 .json /
+        // DSH package.json / 鲸歌 dsh.package.json）。旧脚本包仍带回 manifest，走 0.3.4 的
+        // 试运行/配置/授权链路；声明式包不走 QuickJS。
+        val imported = PackageImporter.importFile(archive)
+        if (imported is PackageImport.Failed) return Result(false, imported.error)
+        imported as PackageImport.Ok
+        val manifest = imported.manifest
+        if (manifest == null) return installDeclarative(imported, enabled)
 
-        val parsed = PluginPackage.parse((read as ArchiveRead.Ok).files)
-        if (parsed is PackageParse.Failed) return Result(false, parsed.error)
-        parsed as PackageParse.Ok
-
-        val manifest = parsed.manifest
+        val files = imported.files
         val target = File(root, dirName(manifest.id))
         val previous = registry.find(manifest.id)
         require(registry.list().none { it.id != manifest.id && File(it.path).canonicalFile == target.canonicalFile }) {
@@ -390,7 +448,7 @@ class PluginStore(private val context: Context) {
         require(!target.exists() || previous != null) { "目标目录已有未登记内容，拒绝覆盖" }
         PluginInstallTransaction(root, dirName(manifest.id)).use { transaction ->
         val dir = transaction.staging
-        writeFiles(dir, wrappedFiles(parsed))
+        writeFiles(dir, wrappedFiles(manifest, files))
 
         // M61：组合包补丁只读解析（cordis.patch.yml 的 insert 行）。鲸歌没有 npm 安装环境，
         // 不按 name 装子插件，只在详情里列出组合包的组成和未执行的条目。
@@ -431,6 +489,9 @@ class PluginStore(private val context: Context) {
             path = transaction.target.absolutePath,
             main = manifest.main,
             format = manifest.format.label,
+            // M87-G：旧脚本包也记一份 IR 元数据（format + 贡献物），加载/权限/角色行为不变。
+            irFormat = imported.ir.format.id,
+            contributions = imported.ir.contributions,
             // 0.3.4（用户 2026-11-15 第 5 条）：导入后默认**停用**，用户显式启用后才进「角色」。
             // 覆盖安装/升级保留用户原来的开关（正在用的插件不会因为重装被悄悄关掉）；
             // 随包内置插件（BundledPlugins）显式传 enabled = true，保持原有安装语义。
@@ -464,10 +525,14 @@ class PluginStore(private val context: Context) {
             projections = run.projections,
             shells = run.shells,
             loadings = run.loadings,
+            slots = run.slots,
             agents = run.agents,
             storages = run.storages,
             prompts = run.prompts,
             capabilities = run.capabilities,
+            toolMiddleware = run.toolMiddleware,
+            llmMiddleware = run.llmMiddleware,
+            storageHooks = run.storageHooks,
             unsupported = run.unsupported,
             provides = run.provides,
             injects = run.injects,
@@ -509,19 +574,152 @@ class PluginStore(private val context: Context) {
         }
     }
 
-    private fun wrappedFiles(parsed: PackageParse.Ok): List<PluginFile> {
-        val files = parsed.files.toMutableList()
-        val main = parsed.manifest.main
-        val index = files.indexOfFirst { it.path == main }
+    /**
+     * M87-G：声明式包（鲸歌轻格式）安装：没有 JS 入口，不跑 QuickJS，只落目录 + IR 记录。
+     * 贡献物的运行时效果按批次推进（主题/页面等依赖 M87-C 槽位），本版先保证「装得进、看得见、
+     * 往返 IR 相等」。
+     */
+    private fun installDeclarative(imported: PackageImport.Ok, enabled: Boolean?): Result {
+        val ir = imported.ir
+        // 鲸歌轻格式里也能声明 script/client，但本版没有「无 package.json 的 JS 安装」链路；
+        // 与其半装（记录里有脚本、实际不执行 apply），不如如实拒绝并指向旧格式。
+        if (ir.hasRuntimeScript()) {
+            return Result(
+                false,
+                "${ir.name}：声明式包里的 script/client 贡献物本版还不能执行；" +
+                    "请用 DSH package.json + main 的格式导入脚本插件",
+            )
+        }
+        val target = File(root, dirName(ir.id))
+        val previous = registry.find(ir.id)
+        require(registry.list().none { it.id != ir.id && File(it.path).canonicalFile == target.canonicalFile }) {
+            "插件 id 与另一个已安装插件的目录冲突"
+        }
+        require(previous == null || File(previous.path).canonicalFile == target.canonicalFile) {
+            "已安装插件路径不属于预期目录，拒绝替换"
+        }
+        require(!target.exists() || previous != null) { "目标目录已有未登记内容，拒绝覆盖" }
+        PluginInstallTransaction(root, dirName(ir.id)).use { transaction ->
+            writeFiles(transaction.staging, imported.files)
+            val requested = PluginPermissions.parseAll(ir.permissions)
+            val grants = PluginPermissions.sanitizeGrants(
+                requested,
+                (previous?.grantedPermissions.orEmpty() + PluginPermissions.autoGrants(requested)).toList(),
+            )
+            val record = PluginRecord(
+                id = ir.id,
+                name = ir.name,
+                version = ir.version,
+                description = ir.description,
+                path = transaction.target.absolutePath,
+                main = ir.main.orEmpty(),
+                format = ir.format.id,
+                irFormat = ir.format.id,
+                contributions = ir.contributions,
+                enabled = enabled ?: previous?.enabled ?: false,
+                tools = emptyList(),
+                imports = emptyList(),
+                error = null,
+                installedAt = System.currentTimeMillis(),
+                permissions = requested.map { it.raw },
+                grantedPermissions = grants.toList(),
+                clientUi = ir.contributions.any { it.kind == ContributionKind.CLIENT },
+                bundlePatch = ir.bundlePatch,
+                enginesDsh = ir.enginesDsh,
+                presets = emptyList(),
+            )
+            val registryBefore = registryFile.takeIf { it.exists() }?.readBytes()
+            transaction.commit {
+                try {
+                    registry.upsert(record)
+                    check(registry.find(record.id) == record) { "插件清单写入失败" }
+                } catch (failure: Exception) {
+                    if (registryBefore != null) registryFile.writeBytes(registryBefore)
+                    else if (registryFile.exists()) check(registryFile.delete()) { "插件清单回滚失败" }
+                    throw failure
+                }
+            }
+            val kinds = ir.contributions.groupingBy { it.kind.id }.eachCount()
+                .entries.joinToString("、") { "${it.key}×${it.value}" }
+            val disabled = if (!record.enabled) "；默认停用（在插件页启用后才可选择角色）" else ""
+            return Result(true, "已导入 ${ir.name} ${ir.version}；声明式包（$kinds）$disabled")
+        }
+    }
+
+    /**
+     * M87-G：声明式包重新加载。目录里的 `dsh.package.json` 才是事实来源；
+     * 不跑 JS，只更新清单字段/贡献物/权限，保留开关与用户配置。
+     */
+    private fun reloadDeclarative(record: PluginRecord, dir: File): Result {
+        val manifest = File(dir, PackageImporter.MANIFEST_NAME)
+        if (!manifest.isFile) {
+            val text = "目录里没有 ${PackageImporter.MANIFEST_NAME}，不是声明式包"
+            registry.upsert(record.copy(error = text))
+            return Result(false, text)
+        }
+        val read = runCatching { manifest.readText(Charsets.UTF_8) }.getOrElse {
+            val text = "读不了 ${manifest.name}：${it.message ?: it.javaClass.simpleName}"
+            registry.upsert(record.copy(error = text))
+            return Result(false, text)
+        }.let { PackageIrCodec.decode(it, "${record.id}/${manifest.name}") }
+        if (read is IrRead.Failed) {
+            val text = "声明式包清单读取失败：${read.error}"
+            registry.upsert(record.copy(error = text))
+            return Result(false, text)
+        }
+        val ir = (read as IrRead.Ok).ir
+        if (ir.id != record.id) {
+            val text = "清单 id 改了（${record.id} → ${ir.id}）：目录和授权还挂在 ${record.id}，要换 id 请重新导入"
+            registry.upsert(record.copy(error = text))
+            return Result(false, text)
+        }
+        val missing = ir.contributions.flatMap { contribution ->
+            (listOfNotNull(contribution.entry) + contribution.assets)
+                .filterNot { File(dir, it).isFile }
+                .map { "${contribution.kind.id} ${contribution.id}：$it" }
+        }
+        if (missing.isNotEmpty()) {
+            val text = "包内文件不在了：${missing.joinToString("、")}"
+            registry.upsert(record.copy(error = text))
+            return Result(false, text)
+        }
+        val requested = PluginPermissions.parseAll(ir.permissions)
+        val grants = PluginPermissions.sanitizeGrants(
+            requested,
+            (record.grantedPermissions + PluginPermissions.autoGrants(requested)).toList(),
+        )
+        val updated = record.copy(
+            name = ir.name,
+            version = ir.version,
+            description = ir.description,
+            main = ir.main.orEmpty(),
+            format = ir.format.id,
+            irFormat = ir.format.id,
+            contributions = ir.contributions,
+            permissions = requested.map { it.raw },
+            grantedPermissions = grants.toList(),
+            clientUi = ir.contributions.any { it.kind == ContributionKind.CLIENT },
+            bundlePatch = ir.bundlePatch,
+            enginesDsh = ir.enginesDsh,
+            error = null,
+        )
+        registry.upsert(updated)
+        return Result(true, "${updated.name}：声明式包已重新读取（${ir.contributions.size} 个贡献物）")
+    }
+
+    private fun wrappedFiles(manifest: PluginManifest, files: List<PluginFile>): List<PluginFile> {
+        val out = files.toMutableList()
+        val main = manifest.main
+        val index = out.indexOfFirst { it.path == main }
         if (index >= 0) {
-            val original = files[index].bytes
+            val original = out[index].bytes
             val source = original.toString(Charsets.UTF_8)
             if (ToolPkg.isToolPkg(source)) {
-                files[index] = PluginFile(main, ToolPkg.wrap(source).toByteArray(Charsets.UTF_8))
-                if (files.none { it.path == "toolpkg-original.js" }) files.add(PluginFile("toolpkg-original.js", original))
+                out[index] = PluginFile(main, ToolPkg.wrap(source).toByteArray(Charsets.UTF_8))
+                if (out.none { it.path == "toolpkg-original.js" }) out.add(PluginFile("toolpkg-original.js", original))
             }
         }
-        return files
+        return out
     }
 
     // ---- 内部 ----

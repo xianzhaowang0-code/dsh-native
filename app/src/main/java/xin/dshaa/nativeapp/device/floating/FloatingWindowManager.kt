@@ -362,8 +362,20 @@ class FloatingWindowManager(
                         WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
                 val safe = (16 * density).toInt()
                 val minVisible = ball / 2
-                state.x = state.x.coerceIn(-ball + minVisible + safe, screenW - minVisible - safe)
-                state.y = state.y.coerceIn(safe, contentH - minVisible - safe)
+                // H2（docs/182）：冷启/服务重启时球要回到**上次球的位置**，不能沿用最后窗口的
+                // `state.x/y`（回程改的位置没落盘，落盘的是窗口坐标；真机验收 2026-11-16 抓到）。
+                val init = ballInitialPosition(
+                    hasBallPosition = state.hasBallPosition,
+                    lastBall = BallReturnPosition(state.lastBallPositionX, state.lastBallPositionY),
+                    fallbackX = state.x,
+                    fallbackY = state.y,
+                    screenW = screenW,
+                    contentH = contentH,
+                    ball = ball,
+                    safePx = safe,
+                )
+                state.x = init.x
+                state.y = init.y
                 params.x = state.x
                 params.y = state.y
             }
@@ -473,6 +485,8 @@ class FloatingWindowManager(
             FloatingMode.BALL, FloatingMode.VOICE_BALL -> {
                 state.lastBallPositionX = params.x
                 state.lastBallPositionY = params.y
+                // H2（docs/182）：记下「真的有过球位置」，回程优先用它，别拿窗口中心代替。
+                state.hasBallPosition = true
             }
 
             FloatingMode.WINDOW -> {
@@ -505,23 +519,29 @@ class FloatingWindowManager(
                 val flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                     WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-                val (nx, ny) = when (oldMode) {
-                    FloatingMode.FULLSCREEN, FloatingMode.SCREEN_OCR ->
-                        (screenW - ball) to (screenH - ball) / 2
-                    FloatingMode.RESULT_DISPLAY ->
-                        state.lastBallPositionX to state.lastBallPositionY
-                    else -> {
-                        val sw = if (params.width == WindowManager.LayoutParams.MATCH_PARENT) screenW else params.width
-                        val sh = if (params.height == WindowManager.LayoutParams.MATCH_PARENT) screenH else params.height
-                        (params.x + sw / 2 - ball / 2) to (params.y + sh / 2 - ball / 2)
-                    }
-                }
-                val minVisible = ball / 2
+                // H2（docs/182）：回程回到「打开窗口前的球位置」，不是窗中心。
+                // 只有从未记录过球位置（全新安装/旧数据）才回退窗口中心（全屏回退右侧居中）。
+                val ballTarget = ballTargetOnReturn(
+                    oldMode = oldMode,
+                    windowX = params.x,
+                    windowY = params.y,
+                    windowWidth = if (params.width == WindowManager.LayoutParams.MATCH_PARENT) screenW else params.width,
+                    windowHeight = if (params.height == WindowManager.LayoutParams.MATCH_PARENT) screenH else params.height,
+                    lastBall = if (state.hasBallPosition) {
+                        BallReturnPosition(state.lastBallPositionX, state.lastBallPositionY)
+                    } else {
+                        null
+                    },
+                    screenW = screenW,
+                    screenH = screenH,
+                    contentH = contentH,
+                    ball = ball,
+                )
                 Target(
                     ball,
                     ball,
-                    nx.coerceIn(-ball + minVisible, screenW - minVisible),
-                    ny.coerceIn(0, contentH - minVisible),
+                    ballTarget.x,
+                    ballTarget.y,
                     flags,
                     Gravity.TOP or Gravity.START,
                     false,
@@ -601,7 +621,16 @@ class FloatingWindowManager(
         val isToBall = newMode == FloatingMode.BALL || newMode == FloatingMode.VOICE_BALL
         val isFromBall = oldMode == FloatingMode.BALL || oldMode == FloatingMode.VOICE_BALL
         if (isToBall && !isFromBall) {
-            handler.postDelayed({ apply(); state.isTransitioning = false }, 150)
+            handler.postDelayed({
+                apply()
+                // H2（docs/182）：回程落点确定后立刻记成「上次球位置」并落盘，
+                // 冷启/服务重启直接用它（不再依赖开窗前的旧值或最后窗口坐标）。
+                state.lastBallPositionX = state.x
+                state.lastBallPositionY = state.y
+                state.hasBallPosition = true
+                callback.saveState()
+                state.isTransitioning = false
+            }, 150)
         } else if (isFromBall && !isToBall) {
             state.ballExploding.value = true
             handler.postDelayed({
@@ -634,6 +663,11 @@ class FloatingWindowManager(
                     val minVisible = ball / 2
                     params.x = params.x.coerceIn(-ball + minVisible, screenW - minVisible)
                     params.y = params.y.coerceIn(0, contentH - minVisible)
+                    // H2（docs/182）：拖球也要更新「上次球位置」，否则拖完直接冷启会回到
+                    // 上一次开窗前的旧位置（真机验收抓到）。
+                    state.lastBallPositionX = params.x
+                    state.lastBallPositionY = params.y
+                    state.hasBallPosition = true
                 }
                 FloatingMode.RESULT_DISPLAY -> Unit
                 else -> {

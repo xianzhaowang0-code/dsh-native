@@ -31,6 +31,7 @@ import xin.dshaa.core.tools.schedule.ScheduleUpdateTool
 import xin.dshaa.core.tools.shell.BashTool
 import xin.dshaa.core.tools.shell.WorkingDirectoryTool
 import xin.dshaa.core.tools.skill.SkillTool
+import xin.dshaa.core.tools.web.HttpRequestTool
 import xin.dshaa.core.tools.web.WebFetchTool
 import xin.dshaa.core.tools.web.WebSearchTool
 import xin.dshaa.core.tools.workspace.LoadWorkspaceDependenciesTool
@@ -56,7 +57,7 @@ object BuiltinToolCatalog {
         ),
         Group("builtin.shell", listOf(BashTool(), WorkingDirectoryTool())),
         Group("builtin.jobs", listOf(JobOutputTool(), JobListTool(), JobKillTool())),
-        Group("builtin.web", listOf(WebFetchTool(), WebSearchTool())),
+        Group("builtin.web", listOf(WebFetchTool(), WebSearchTool(), HttpRequestTool())),
         Group(
             "builtin.agent",
             listOf(SubagentTool(), SubagentTool(fork = true), ListAgentsTool(), SendMessageTool(), InterruptAgentTool()),

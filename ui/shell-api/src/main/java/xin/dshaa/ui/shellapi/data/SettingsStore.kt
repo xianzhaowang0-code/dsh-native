@@ -25,6 +25,16 @@ class SettingsStore(private val sp: SharedPreferences) {
      */
     private val _llmProviderId = mutableStateOf(sp.getString(KEY_LLM_PROVIDER, "").orEmpty())
     private val _approvalMode = mutableStateOf(sp.getString(KEY_APPROVAL, "ask")!!)
+    /**
+     * M87-F（docs/181 §3.1 第 7 条）：插件中间件总开关。默认开；关掉 = 工具/请求/存储/事件钩子
+     * 全部旁路（排障用），插槽与插件注册不受影响。
+     */
+    private val _pluginMiddlewareEnabled = mutableStateOf(sp.getBoolean(KEY_PLUGIN_MIDDLEWARE, true))
+    /**
+     * M88-E（docs/183 §5）：AI 全控制插件总开关。默认开；关掉后
+     * `plugin_dev_grant/revoke/config/role` 四个工具返回 `ai_plugin_control_disabled`。
+     */
+    private val _aiPluginControl = mutableStateOf(sp.getBoolean(KEY_AI_PLUGIN_CONTROL, true))
     // ---- 助手配置（M73）：多份角色卡，侧边栏切换当前使用 ----
     // 旧单份字段（assistant_name/desc/avatar/persona/opening/system）只作首次迁移来源，
     // 之后每次改动继续同步写回，保证备份/调试通道/降级还能读到「当前这份」。
@@ -126,6 +136,12 @@ class SettingsStore(private val sp: SharedPreferences) {
     /** 旧字段：account / api-key。由 [providerId] 推导，别直接写。 */
     val provider: String get() = "api-key"
     val approvalMode: String get() = _approvalMode.value
+
+    /** M87-F：插件中间件总开关（关 = 工具/请求/存储/事件钩子全部旁路）。 */
+    val pluginMiddlewareEnabled: Boolean get() = _pluginMiddlewareEnabled.value
+
+    /** M88-E：AI 全控制插件（授予/撤销/配置/角色）总开关，默认开。 */
+    val aiPluginControl: Boolean get() = _aiPluginControl.value
 
     /** 全部助手配置（M73）：至少一份；顺序 = 用户创建顺序。 */
     val assistantProfiles: List<AssistantProfile> get() = _assistantProfiles.value
@@ -278,6 +294,20 @@ class SettingsStore(private val sp: SharedPreferences) {
 
     fun setApprovalMode(v: String) {        _approvalMode.value = v
         sp.edit().putString(KEY_APPROVAL, v).apply()
+    }
+
+    /** M87-F：插件中间件总开关（宿主的链重建由 AppViewModel 负责）。 */
+    fun setPluginMiddlewareEnabled(enabled: Boolean) {
+        if (_pluginMiddlewareEnabled.value == enabled) return
+        _pluginMiddlewareEnabled.value = enabled
+        sp.edit().putBoolean(KEY_PLUGIN_MIDDLEWARE, enabled).apply()
+    }
+
+    /** M88-E：AI 全控制插件总开关（关掉后四个插件控制工具直接拒绝）。 */
+    fun setAiPluginControl(enabled: Boolean) {
+        if (_aiPluginControl.value == enabled) return
+        _aiPluginControl.value = enabled
+        sp.edit().putBoolean(KEY_AI_PLUGIN_CONTROL, enabled).apply()
     }
 
     fun setAssistantName(v: String) = updateActiveAssistant { it.copy(name = v.trim().ifBlank { "鲸歌" }) }
@@ -614,6 +644,9 @@ class SettingsStore(private val sp: SharedPreferences) {
         /** M84-C3：显式选择的模型通道 id；空 = 跟随协议。 */
         private const val KEY_LLM_PROVIDER = "llm_provider_id"
         private const val KEY_APPROVAL = "approval_mode"
+        /** M87-F：插件中间件总开关（默认 true）。 */
+        private const val KEY_PLUGIN_MIDDLEWARE = "plugin_middleware_enabled"
+        private const val KEY_AI_PLUGIN_CONTROL = "ai_plugin_control"
         private const val KEY_ASSISTANT_NAME = "assistant_name"
         private const val KEY_ASSISTANT_DESC = "assistant_desc"
         private const val KEY_ASSISTANT_AVATAR = "assistant_avatar"

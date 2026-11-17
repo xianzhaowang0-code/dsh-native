@@ -46,16 +46,38 @@ interface NativeShellHost {
     /** 当前本机/远程来源的共享聊天入口；旧 chat/submit 等成员继续只代表本机。 */
     val conversation: ShellConversation
 
+    /**
+     * M87-C：插件插槽注册表（docs/181 §3.4）。`null` = 这个壳不接受插件插槽；
+     * 原生壳在聊天输入条上方 / 工具卡 body / 设置首页读取它渲染 `chat.composer.dock` 等槽位。
+     */
+    val slotRegistry: SlotRegistry? get() = null
+
     // ── 聊天：状态 / 回合 / 审批 / 答题 / plan / goal / 日程 ───────────────────────────
 
     /** 当前会话状态（null = 落地页，还没建草稿）。 */
     val chat: ChatSessionState?
+
+    /**
+     * M87-H5：外部入口（目前是插件通知点击）要求回到聊天落地页。
+     * 每次请求自增；壳把页面栈清回聊天后调 [consumeLandingChatRequest]。
+     */
+    val landingChatRequest: Long
+
+    fun consumeLandingChatRequest()
 
     /** 提交一条输入（`/命令` 也走这里）。返回是否已接受，可包含已保存的排队输入。 */
     fun submit(text: String): Boolean
 
     /** 停止当前回合。 */
     fun stop()
+
+    /**
+     * H1（docs/182）：上一轮被 max_tokens 截断时点「继续生成」。
+     *
+     * 只对 `TurnOutcome.MAX_TOKENS` 留下的标记生效；点一次消费一次（连点/重发不会重复起轮），
+     * 发送未被接受时把标记还原（按钮不丢）。返回是否已接受。
+     */
+    fun continueTruncated(): Boolean
 
     fun cancelQueuedPrompt(id: String)
 
@@ -213,6 +235,36 @@ interface NativeShellHost {
     fun savePluginConfig(id: String, jsonText: String)
 
     fun dismissPluginNotice()
+
+    // ── M87-F：扩展点诊断 / 插件中间件总开关 ─────────────────────────────────────────
+
+    /** 插件页「扩展点」页签的逐链快照（按插件清单顺序）。 */
+    val pluginExtensionsUi: List<PluginExtensionUi>
+
+    /** 设置里的「插件中间件」总开关（关 = 工具/请求/存储/事件钩子全部旁路）。 */
+    val pluginMiddlewareEnabled: Boolean
+
+    /** 重新计算逐链快照（页签打开时调用，拿到最新命中/耗时）。 */
+    fun refreshPluginExtensions()
+
+    fun setPluginMiddlewareEnabled(enabled: Boolean)
+
+    // ── M88-E：AI 全控制插件（审计 / 开关 / 撤销） ─────────────────────────────────
+
+    /** 设置里的「AI 全控制插件」总开关（关 = grant/revoke/config/role 直接拒绝）。 */
+    val aiPluginControlEnabled: Boolean
+
+    fun setAiPluginControl(enabled: Boolean)
+
+    /** 撤销本进程最近一次 AI 授予（或按审计回放找最近一条）。 */
+    fun undoAiPluginGrant()
+
+    /** 插件详情底部：该插件最近 5 条审计（AI 与用户操作）。 */
+    fun pluginAuditLines(pluginId: String): List<String>
+
+    /** 权限行标「AI 授予」：按审计回放当前仍由 AI 授予的权限。 */
+    fun aiGrantedPermissions(pluginId: String): Set<String>
+
 
     fun openClientPluginWindow(record: PluginRecord)
 

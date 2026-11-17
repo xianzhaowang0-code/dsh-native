@@ -392,6 +392,8 @@ data class PluginDryRun(
     val shells: List<PluginShell> = emptyList(),
     /** Static loading/v1 declarations; usable before any plugin runtime starts. */
     val loadings: List<PluginLoading> = emptyList(),
+    /** M87-C：声明式宿主插槽（槽位 + Surface 子树，安装时已按 [SlotSpec] 校验）。 */
+    val slots: List<PluginSlot> = emptyList(),
     /** M85-D：`ctx.agent.register(...)` 登记的回合实现（agent/v1，定义留在常驻 JS 里）。 */
     val agents: List<PluginAgent> = emptyList(),
     /** M85-E：`ctx.storage.register(...)` 登记的存储实现（storage/v1，定义留在常驻 JS 里）。 */
@@ -400,6 +402,12 @@ data class PluginDryRun(
     val prompts: List<PluginPrompt> = emptyList(),
     /** M85-F：`ctx.capability.register(...)` 登记的能力提供方（capability/v1，invoke 闭包留在常驻 JS 里）。 */
     val capabilities: List<PluginCapabilityProvider> = emptyList(),
+    /** M87-A：本插件注册了工具中间件（`ctx.tools.restrict/guard/describe/on`）。 */
+    val toolMiddleware: Boolean = false,
+    /** M87-B：本插件注册了请求/提示词中间件（`ctx.on('agent/request'|'llm/stream'|…)`）。 */
+    val llmMiddleware: Boolean = false,
+    /** M87-E：本插件注册了会话写入钩子（`ctx.storage.on('before-append'|'after-load')`）。 */
+    val storageHooks: Boolean = false,
     /**
      * 插件用到、但鲸歌未实现的宿主能力（`sessionProjections` / `llm.register` /
      * `ui.register*` / `ctx.on` 等）。插件页明确展示，不再静默吞掉。
@@ -506,6 +514,15 @@ data class PluginRecord(
     val prompts: List<PluginPrompt> = emptyList(),
     /** M85-F：本插件注册的能力提供方（`ctx.capability.register`，capability/v1）。 */
     val capabilities: List<PluginCapabilityProvider> = emptyList(),
+    /**
+     * M87-A：本插件注册了工具中间件（restrict/guard/describe/pre/post/result）。
+     * 宿主要据此起常驻 JS 运行时（闭包不能留在一次性 runtime 里）。
+     */
+    val toolMiddleware: Boolean = false,
+    /** M87-B：本插件注册了请求/提示词中间件（`ctx.on` 的四个请求扩展点）。 */
+    val llmMiddleware: Boolean = false,
+    /** M87-E：本插件注册了会话写入钩子（`ctx.storage.on('before-append'|'after-load')`）。 */
+    val storageHooks: Boolean = false,
     /** 插件用到但鲸歌未实现的宿主能力。 */
     val unsupported: List<String> = emptyList(),
     /** M83 服务容器：本插件 `ctx.provide(name, value)` 的服务名 → 值 JSON 快照。 */
@@ -518,6 +535,17 @@ data class PluginRecord(
     val effects: List<String> = emptyList(),
     /** M83：`ctx.on` 登记的事件名。 */
     val subscriptions: List<String> = emptyList(),
+    /**
+     * M87-G：统一包 IR 的格式（`whale-lite` / `dsh` / `legacy-js` / `operit`）。
+     * 旧记录（0.3.4 及以前）读盘时迁移为 `legacy-js`，不重装、不改开关。
+     *
+     * 放在构造参数末尾：0.3.4 的测试/调用大量用位置参数，不能插在中间。
+     */
+    val irFormat: String = PackageFormat.LEGACY_JS.id,
+    /** M87-G：统一包 IR 的贡献物（脚本/客户端/技能/主题/页面/宏/MCP/HTTP 工具/素材）。 */
+    val contributions: List<PluginContribution> = emptyList(),
+    /** M87-C/D：插件往宿主原生界面注册的插槽（见 [SlotSpec.SLOTS]）。 */
+    val slots: List<PluginSlot> = emptyList(),
 )
 
 /**
@@ -594,7 +622,7 @@ class PluginRegistryFile(private val file: File) {
                 val id = obj["id"]?.let { runCatching { it.jsonPrimitive.contentOrNull }.getOrNull() } ?: return@mapNotNull null
                 val path = obj["path"]?.let { runCatching { it.jsonPrimitive.contentOrNull }.getOrNull() } ?: return@mapNotNull null
                 val permissions = obj.stringList("permissions")
-                PluginRecord(
+                val record = PluginRecord(
                     id = id,
                     name = obj.string("name") ?: id,
                     version = obj.string("version") ?: "",
@@ -602,6 +630,8 @@ class PluginRegistryFile(private val file: File) {
                     path = path,
                     main = obj.string("main") ?: "",
                     format = obj.string("format") ?: PluginFormat.DSH.label,
+                    irFormat = obj.string("irFormat") ?: PackageFormat.LEGACY_JS.id,
+                    contributions = obj.contributions("contributions"),
                     enabled = obj.boolean("enabled") ?: true,
                     tools = obj.stringList("tools"),
                     toolDescriptions = obj.stringMap("toolDescriptions"),
@@ -700,6 +730,7 @@ class PluginRegistryFile(private val file: File) {
                             )
                         }.orEmpty(),
                     loadings = LoadingSpec.parseAll(obj["loadings"]),
+                    slots = SlotSpec.parseAll(obj["slots"]),
                     agents = (obj["agents"] as? kotlinx.serialization.json.JsonArray)
                         ?.mapNotNull { element ->
                             val agent = element as? kotlinx.serialization.json.JsonObject ?: return@mapNotNull null
@@ -737,6 +768,9 @@ class PluginRegistryFile(private val file: File) {
                                 kind = capability.string("kind"),
                             )
                         }.orEmpty(),
+                    toolMiddleware = obj.boolean("toolMiddleware") ?: false,
+                    llmMiddleware = obj.boolean("llmMiddleware") ?: false,
+                    storageHooks = obj.boolean("storageHooks") ?: false,
                     unsupported = obj.stringList("unsupported"),
                     provides = obj.stringMap("provides"),
                     injects = (obj["injects"] as? kotlinx.serialization.json.JsonArray)?.mapNotNull { element ->
@@ -748,6 +782,13 @@ class PluginRegistryFile(private val file: File) {
                     effects = obj.stringList("effects"),
                     subscriptions = obj.stringList("subscriptions"),
                 )
+                // M87-G 迁移：旧记录没有 contributions，按 0.3.4 的字段补出脚本/客户端/预设，
+                // 并把 irFormat 标成 legacy-js；不重装、不改开关、id/权限/角色不变。
+                if (obj["contributions"] == null) {
+                    record.copy(contributions = legacyContributions(record))
+                } else {
+                    record
+                }
             }.orEmpty()
         }.getOrDefault(emptyList())
     }
@@ -770,6 +811,34 @@ class PluginRegistryFile(private val file: File) {
                                     put("path", record.path)
                                     put("main", record.main)
                                     put("format", record.format)
+                                    put("irFormat", record.irFormat)
+                                    if (record.contributions.isNotEmpty()) {
+                                        put(
+                                            "contributions",
+                                            buildJsonArray {
+                                                record.contributions.forEach { contribution ->
+                                                    add(
+                                                        buildJsonObject {
+                                                            put("kind", contribution.kind.id)
+                                                            put("id", contribution.id)
+                                                            if (contribution.config.isNotEmpty()) {
+                                                                put("config", contribution.config)
+                                                            }
+                                                            if (contribution.assets.isNotEmpty()) {
+                                                                put(
+                                                                    "assets",
+                                                                    buildJsonArray {
+                                                                        contribution.assets.forEach { add(JsonPrimitive(it)) }
+                                                                    },
+                                                                )
+                                                            }
+                                                            contribution.entry?.let { put("entry", it) }
+                                                        },
+                                                    )
+                                                }
+                                            },
+                                        )
+                                    }
                                     put("enabled", record.enabled)
                                     put("tools", buildJsonArray { record.tools.forEach { add(JsonPrimitive(it)) } })
                                     if (record.toolDescriptions.isNotEmpty()) {
@@ -801,6 +870,13 @@ class PluginRegistryFile(private val file: File) {
                                     if (record.configDefaults != "{}") put("configDefaults", record.configDefaults)
                                     record.configError?.let { put("configError", it) }
                                     if (record.clientUi) put("clientUi", true)
+                                    // M87-A：工具中间件标记必须落盘；否则重载后宿主要么以为没中间件
+                                    //（常驻 runtime 不起），要么安装时 registry.find != record 校验失败。
+                                    if (record.toolMiddleware) put("toolMiddleware", true)
+                                    // M87-B：请求/提示词中间件标记同样要落盘（决定常驻 runtime 是否起）。
+                                    if (record.llmMiddleware) put("llmMiddleware", true)
+                                    // M87-E：写入钩子标记同样要落盘（决定常驻 runtime 是否起）。
+                                    if (record.storageHooks) put("storageHooks", true)
                                     record.bundlePatch?.let { put("bundlePatch", it) }
                                     record.enginesDsh?.let { put("enginesDsh", it) }
                                     if (record.bundleChildren.isNotEmpty()) {
@@ -963,6 +1039,11 @@ class PluginRegistryFile(private val file: File) {
                                             record.loadings.forEach { add(LoadingSpec.declaration(it)) }
                                         })
                                     }
+                                    if (record.slots.isNotEmpty()) {
+                                        put("slots", buildJsonArray {
+                                            record.slots.forEach { add(SlotSpec.declaration(it)) }
+                                        })
+                                    }
                                     if (record.agents.isNotEmpty()) {
                                         put(
                                             "agents",
@@ -1097,6 +1178,37 @@ class PluginRegistryFile(private val file: File) {
         this[key]?.let { element ->
             runCatching { element.jsonArray.mapNotNull { it.jsonPrimitive.contentOrNull } }.getOrNull()
         }.orEmpty()
+
+    /** M87-G：读回贡献物；认不出的 kind 丢掉（不猜），坏一条不影响整份清单。 */
+    private fun kotlinx.serialization.json.JsonObject.contributions(key: String): List<PluginContribution> =
+        (this[key] as? kotlinx.serialization.json.JsonArray)?.mapNotNull { element ->
+            val obj = element as? kotlinx.serialization.json.JsonObject ?: return@mapNotNull null
+            val kind = ContributionKind.fromId(obj.string("kind")) ?: return@mapNotNull null
+            val id = obj.string("id")?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            PluginContribution(
+                kind = kind,
+                id = id,
+                config = obj["config"] as? kotlinx.serialization.json.JsonObject
+                    ?: kotlinx.serialization.json.JsonObject(emptyMap()),
+                assets = obj.stringList("assets"),
+                entry = obj.string("entry")?.takeIf { it.isNotBlank() },
+            )
+        }.orEmpty()
+
+    /** 旧记录迁移：脚本/客户端/预设按 0.3.4 字段补成 IR 贡献物。 */
+    private fun legacyContributions(record: PluginRecord): List<PluginContribution> {
+        val out = ArrayList<PluginContribution>()
+        if (record.main.isNotBlank()) {
+            out += PluginContribution(ContributionKind.SCRIPT, record.id, entry = record.main)
+        }
+        if (record.clientUi) {
+            out += PluginContribution(ContributionKind.CLIENT, "${record.id}.client")
+        }
+        record.presets.forEach { preset ->
+            out += PluginContribution(ContributionKind.PRESET, preset.presetId)
+        }
+        return out
+    }
 
     /** 字符串 map（工具说明 / 工具 schema）；值不是字符串就跳过，坏一条不影响整份清单。 */
     private fun kotlinx.serialization.json.JsonObject.stringMap(key: String): Map<String, String> =

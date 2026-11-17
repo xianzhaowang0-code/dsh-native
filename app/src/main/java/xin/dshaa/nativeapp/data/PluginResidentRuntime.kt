@@ -38,6 +38,57 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicReference
 
 /**
+ * M87-A：一个插件注册的工具中间件元数据（闭包留在常驻 runtime，宿主只拿这些做同步快速路径）。
+ *
+ * - [restrict] 是 glob 模式（只删工具）；[guard] 是同步拒绝的工具名（`*` = 全部）；
+ * - [describe] 是静态描述/schema patch（宿主直接套，不再往返 JS）；
+ * - [preExecute]/[postExecute]/[result] 是注册数量（调用仍 dispatch 进 runtime）。
+ */
+data class ToolMiddlewareMeta(
+    val active: Boolean = false,
+    val restrict: List<String> = emptyList(),
+    val guard: List<String> = emptyList(),
+    val describe: List<ToolDescribe> = emptyList(),
+    val preExecute: Int = 0,
+    val postExecute: Int = 0,
+    val result: Int = 0,
+) {
+    val hasHooks: Boolean get() = preExecute > 0 || postExecute > 0 || result > 0
+
+    val isEmpty: Boolean
+        get() = !active && restrict.isEmpty() && guard.isEmpty() && describe.isEmpty() && !hasHooks
+}
+
+/** describe 的一条静态 patch；[patch] 是插件给的 `{description, parameters}`。 */
+data class ToolDescribe(val tool: String, val patch: JsonObject?)
+
+/**
+ * M87-B：一个插件注册的请求/提示词中间件元数据（闭包留在常驻 runtime）。
+ *
+ * 计数只用于「是否挂链 / 诊断页展示」；真正的调用仍 dispatch 进 runtime（每次 50ms 预算）。
+ */
+data class LlmMiddlewareMeta(
+    val active: Boolean = false,
+    val request: Int = 0,
+    val assemble: Int = 0,
+    val stream: Int = 0,
+    val preStep: Int = 0,
+) {
+    val isEmpty: Boolean get() = !active && request == 0 && assemble == 0 && stream == 0 && preStep == 0
+}
+
+/**
+ * M87-E：一个插件注册的会话写入钩子（`ctx.storage.on('before-append'|'after-load')`）。
+ * 闭包留在常驻 runtime；计数只用于「是否挂钩子 / 诊断页」。
+ */
+data class StorageHooksMeta(
+    val beforeAppend: Int = 0,
+    val afterLoad: Int = 0,
+) {
+    val isEmpty: Boolean get() = beforeAppend == 0 && afterLoad == 0
+}
+
+/**
  * M84-H：插件**常驻 JS 运行时**与会话投影宿主。
  *
  * 背景：`QuickJs` 是「一次 evaluate = 新建 runtime、结算后销毁」，插件注册的每事件回调留不住；
@@ -77,6 +128,13 @@ class PluginResidentRuntime(
     private val builtinSessionExport: (String, String) -> String = { _, _ ->
         """{"ok":false,"error":"宿主没有提供会话导出原语"}"""
     },
+    /**
+     * M87-F：插件中间件总开关。false = 不投递 `session/event` 观察、不投 after-load
+     * （存储写入钩子的 veto 由 `SessionWriteHooks.bypass` 旁路）。默认开。
+     */
+    private val hooksEnabled: () -> Boolean = { true },
+    /** M87-F：after-load dispatch 完成后回报（插件 id、是否成功、错误、耗时 ms），诊断页用。 */
+    private val onAfterLoad: (pluginId: String, ok: Boolean, error: String?, ms: Long) -> Unit = { _, _, _, _ -> },
 ) {
 
     /** 一条投影值（`wire.view` 或 state 的 JSON 文本）。 */
@@ -93,6 +151,8 @@ class PluginResidentRuntime(
     private sealed interface QueueItem {
         class Event(val payload: String) : QueueItem
         class Restore(val payload: String) : QueueItem
+        /** M87-E：会话打开并重放后通知 after-load 钩子（只观测）。 */
+        class AfterLoad(val payload: String) : QueueItem
     }
 
     /** 一个插件的常驻运行时。 */
@@ -114,6 +174,14 @@ class PluginResidentRuntime(
         val storages: MutableList<String>,
         /** M85-E：注册的提示词实现 id（prompt/v1；同步状态/dump 用）。 */
         val prompts: MutableList<String>,
+        /** M87-A：注册的工具中间件元数据（restrict/guard/describe 同步应用，钩子 dispatch 进 runtime）。 */
+        val toolMiddleware: ToolMiddlewareMeta = ToolMiddlewareMeta(),
+        /** M87-B：注册的请求/提示词中间件元数据（闭包在 runtime 里，宿主按点 dispatch）。 */
+        val llmMiddleware: LlmMiddlewareMeta = LlmMiddlewareMeta(),
+        /** M87-E：注册的会话写入钩子元数据（before-append/after-load 闭包在 runtime 里）。 */
+        val storageHooks: StorageHooksMeta = StorageHooksMeta(),
+        /** M87-C：注册的插槽 id（`slot/id`，供诊断/dump；渲染以 plugins.json 的声明为准）。 */
+        val slots: List<String> = emptyList(),
         /** M84-M：callId → 本次 stream 的增量接收器（插件 `emit` 同步回灌进来）。 */
         val streamSinks: ConcurrentHashMap<String, (String) -> Unit>,
         var startedAt: Long,
@@ -167,6 +235,18 @@ class PluginResidentRuntime(
     /** M85-E：这个插件当前注册了哪些提示词实现（`ctx.systemPrompt.register`）。 */
     fun promptsOf(pluginId: String): List<String> = residencies[pluginId]?.prompts?.toList().orEmpty()
 
+    /** M87-A：这个插件注册的工具中间件（运行时还没起来/没注册 = null）。 */
+    fun toolMiddlewareOf(pluginId: String): ToolMiddlewareMeta? = residencies[pluginId]?.toolMiddleware
+
+    /** M87-B：这个插件注册的请求/提示词中间件（运行时还没起来/没注册 = null）。 */
+    fun llmMiddlewareOf(pluginId: String): LlmMiddlewareMeta? = residencies[pluginId]?.llmMiddleware
+
+    /** M87-E：这个插件注册的会话写入钩子（运行时还没起来/没注册 = null）。 */
+    fun storageHooksOf(pluginId: String): StorageHooksMeta? = residencies[pluginId]?.storageHooks
+
+    /** M87-E：这个插件订阅的会话事件名（`session/event` / 具体事件 / `*`）。 */
+    fun subscriptionsOf(pluginId: String): List<String> = residencies[pluginId]?.subscriptions?.toList().orEmpty()
+
     /** Only stream callbacks actually registered by this runtime, not stale dry-run metadata. */
     fun streamsOf(pluginId: String): List<String> = residencies[pluginId]?.streams?.toList().orEmpty()
 
@@ -182,7 +262,8 @@ class PluginResidentRuntime(
                     record.effects.isNotEmpty() || record.llmProviders.any { it.hasStream } ||
                     record.shells.isNotEmpty() || record.agents.isNotEmpty() ||
                     record.storages.isNotEmpty() || record.prompts.isNotEmpty() ||
-                    record.capabilities.isNotEmpty()) &&
+                    record.capabilities.isNotEmpty() || record.toolMiddleware || record.llmMiddleware ||
+                    record.storageHooks || record.slots.isNotEmpty()) &&
                 File(record.path, record.main).isFile
         }
         val wantedIds = wanted.map { it.id }.toSet()
@@ -238,7 +319,10 @@ class PluginResidentRuntime(
         val sessionId = session.header.id
         if (observed.putIfAbsent(sessionId, session) != null) return
         session.addEventListener { event -> deliver(session, event) }
-        for (residency in residencies.values) replayInto(residency, session)
+        for (residency in residencies.values) {
+            replayInto(residency, session)
+            enqueueAfterLoad(residency, session)
+        }
         Log.i(TAG, "attached session=$sessionId events=${session.events.size} residents=${residencies.size}")
     }
 
@@ -376,6 +460,16 @@ class PluginResidentRuntime(
         buildJsonObject { put("ok", false); put("error", message) }.toString()
 
     /**
+     * M87-H5：`plugin.notify` / `agent.notify` 的 notify 权限门。
+     * 返回 null = 放行；非 null = 给插件 JS 的结构化拒绝（不再静默成功）。
+     */
+    private fun notifyGate(record: PluginRecord): String? {
+        if (PluginPermissions.notifyGranted(record.permissions, record.grantedPermissions)) return null
+        Log.w(TAG, "notify denied plugin=${record.id}: notify permission not granted")
+        return PluginPermissions.NOTIFY_DENIED_JSON
+    }
+
+    /**
      * M85-D：`agent/v1` 的宿主原语。
      *
      * 权限门和 sandbox 一致：必须真的拿到 `agent` 授权（导入即允许，但停用/撤销后立刻失效）。
@@ -395,6 +489,8 @@ class PluginResidentRuntime(
         val payload = runCatching { Json.parseToJsonElement(payloadJson).jsonObject }.getOrNull()
         return when (method) {
             "agent.notify" -> {
+                // M87-H5：agent.notify 除了 agent 授权，还要独立的 notify 授权。
+                notifyGate(record)?.let { return it }
                 val title = payload?.get("title")?.let { runCatching { it.jsonPrimitive.content }.getOrNull() }
                     ?: "回合插件"
                 val body = payload?.get("body")?.let { runCatching { it.jsonPrimitive.content }.getOrNull() } ?: ""
@@ -475,6 +571,53 @@ class PluginResidentRuntime(
                             put(
                                 "prompts",
                                 JsonArray(residency.prompts.map { kotlinx.serialization.json.JsonPrimitive(it) }),
+                            )
+                            put(
+                                "toolMiddleware",
+                                buildJsonObject {
+                                    put("active", residency.toolMiddleware.active)
+                                    put(
+                                        "restrict",
+                                        JsonArray(
+                                            residency.toolMiddleware.restrict.map {
+                                                kotlinx.serialization.json.JsonPrimitive(it)
+                                            },
+                                        ),
+                                    )
+                                    put(
+                                        "guard",
+                                        JsonArray(
+                                            residency.toolMiddleware.guard.map {
+                                                kotlinx.serialization.json.JsonPrimitive(it)
+                                            },
+                                        ),
+                                    )
+                                    put("describe", residency.toolMiddleware.describe.size)
+                                    put("preExecute", residency.toolMiddleware.preExecute)
+                                    put("postExecute", residency.toolMiddleware.postExecute)
+                                    put("result", residency.toolMiddleware.result)
+                                },
+                            )
+                            put(
+                                "llmMiddleware",
+                                buildJsonObject {
+                                    put("active", residency.llmMiddleware.active)
+                                    put("request", residency.llmMiddleware.request)
+                                    put("assemble", residency.llmMiddleware.assemble)
+                                    put("stream", residency.llmMiddleware.stream)
+                                    put("preStep", residency.llmMiddleware.preStep)
+                                },
+                            )
+                            put(
+                                "storageHooks",
+                                buildJsonObject {
+                                    put("beforeAppend", residency.storageHooks.beforeAppend)
+                                    put("afterLoad", residency.storageHooks.afterLoad)
+                                },
+                            )
+                            put(
+                                "slots",
+                                JsonArray(residency.slots.map { kotlinx.serialization.json.JsonPrimitive(it) }),
                             )
                             put("startedAt", residency.startedAt)
                             put("error", residency.error ?: "")
@@ -608,6 +751,8 @@ class PluginResidentRuntime(
                         return """{"ok":true}"""
                     }
                     if (method == "plugin.notify") {
+                        // M87-H5：与一次性 QuickJS 路径同一道 notify 权限门。
+                        notifyGate(record)?.let { return it }
                         val payload = runCatching { Json.parseToJsonElement(payloadJson).jsonObject }.getOrNull()
                         val title = payload?.get("title")?.let { runCatching { it.jsonPrimitive.content }.getOrNull() }
                             ?: "插件通知"
@@ -665,6 +810,10 @@ class PluginResidentRuntime(
             val storages = mutableListOf<String>()
             val prompts = mutableListOf<String>()
             val capabilities = mutableListOf<String>()
+            var toolMiddleware = ToolMiddlewareMeta()
+            var llmMiddleware = LlmMiddlewareMeta()
+            var storageHooks = StorageHooksMeta()
+            var slotIds: List<String> = emptyList()
             var cleanups = 0
             var startError: String? = null
             when (outcome.status) {
@@ -681,6 +830,10 @@ class PluginResidentRuntime(
                         storages += parsed.storages
                         prompts += parsed.prompts
                         capabilities += parsed.capabilities
+                        toolMiddleware = parsed.toolMiddleware
+                        llmMiddleware = parsed.llmMiddleware
+                        storageHooks = parsed.storageHooks
+                        slotIds = parsed.slots
                         cleanups = parsed.cleanups
                         if (parsed.error.isNotBlank()) startError = parsed.error
                     }
@@ -692,7 +845,8 @@ class PluginResidentRuntime(
             if (startError != null ||
                 (keys.isEmpty() && subscriptions.isEmpty() && cleanups == 0 && streams.isEmpty() &&
                     shells.isEmpty() && agents.isEmpty() && storages.isEmpty() && prompts.isEmpty() &&
-                    capabilities.isEmpty())
+                    capabilities.isEmpty() && toolMiddleware.isEmpty && llmMiddleware.isEmpty &&
+                    storageHooks.isEmpty && slotIds.isEmpty())
             ) {
                 addError(record.id, startError ?: "插件没有注册投影/事件订阅/清理器/stream/壳/回合/存储/提示词/能力")
                 Log.w(TAG, "resident start failed for ${record.id}: ${startError ?: "nothing registered"}")
@@ -715,6 +869,10 @@ class PluginResidentRuntime(
                 agents = agents,
                 storages = storages,
                 prompts = prompts,
+                toolMiddleware = toolMiddleware,
+                llmMiddleware = llmMiddleware,
+                storageHooks = storageHooks,
+                slots = slotIds,
                 streamSinks = streamSinks,
                 startedAt = System.currentTimeMillis(),
                 error = null,
@@ -727,11 +885,18 @@ class PluginResidentRuntime(
                 "resident started plugin=${record.id} keys=${keys.joinToString(",")} " +
                     "subscriptions=${subscriptions.joinToString(",")} cleanups=$cleanups streams=${streams.joinToString(",")} " +
                     "shells=${shells.joinToString(",")} agents=${agents.joinToString(",")} " +
-                    "storages=${storages.joinToString(",")} prompts=${prompts.joinToString(",")}",
+                    "storages=${storages.joinToString(",")} prompts=${prompts.joinToString(",")} " +
+                    "tools=${toolMiddleware.active} restrict=${toolMiddleware.restrict.joinToString(",")} " +
+                    "guard=${toolMiddleware.guard.joinToString(",")} " +
+                    "llm=${llmMiddleware.active} request=${llmMiddleware.request} assemble=${llmMiddleware.assemble} " +
+                    "stream=${llmMiddleware.stream} preStep=${llmMiddleware.preStep} " +
+                    "storageHooks=${storageHooks.beforeAppend}/${storageHooks.afterLoad} " +
+                    "slots=${slotIds.joinToString(",")}",
             )
             // 已在观察中的会话：按 checkpoint 补投（App 重启只补 seq > lastSeq 的事件）
             for (live in observed.values.toList()) {
                 replayInto(residency, live)
+                enqueueAfterLoad(residency, live)
             }
             // M85-E：存储/提示词插件要等 runtime 起来才能列会话/拼提示词，通知宿主刷新。
             runCatching { onResidentStarted(record.id) }
@@ -768,6 +933,7 @@ class PluginResidentRuntime(
 
     private fun deliver(session: SessionSession, event: SessionEvent) {
         if (residencies.isEmpty()) return
+        if (!hooksEnabled()) return
         val payload = payloadOf(session, event)
         for (residency in residencies.values) enqueue(residency, QueueItem.Event(payload))
     }
@@ -778,14 +944,33 @@ class PluginResidentRuntime(
         }
     }
 
-    private fun payloadOf(session: SessionSession, event: SessionEvent): String {
-        val header = buildJsonObject {
-            put("id", session.header.id)
-            put("cwd", session.header.cwd)
-            put("createdAt", session.header.createdAt)
-            put("agentPreset", session.header.agentPreset ?: "")
-            put("parentSession", session.header.parentSession ?: "")
+    /** M87-E：只对「注册了 after-load + 有 storage:hooks 授权」的常驻运行时投递一次。 */
+    private fun enqueueAfterLoad(residency: Residency, session: SessionSession) {
+        if (!hooksEnabled()) return
+        if (residency.storageHooks.afterLoad <= 0) return
+        if (!PluginPermissions.storageHooksGranted(residency.record.permissions, residency.record.grantedPermissions)) {
+            Log.w(TAG, "storage:hooks not granted plugin=${residency.record.id}; after-load skipped")
+            return
         }
+        enqueue(residency, QueueItem.AfterLoad(afterLoadPayload(session)))
+    }
+
+    private fun afterLoadPayload(session: SessionSession): String = buildJsonObject {
+        put("sessionId", session.header.id)
+        put("header", headerJson(session))
+        put("eventCount", session.events.size)
+    }.toString()
+
+    private fun headerJson(session: SessionSession): JsonObject = buildJsonObject {
+        put("id", session.header.id)
+        put("cwd", session.header.cwd)
+        put("createdAt", session.header.createdAt)
+        put("agentPreset", session.header.agentPreset ?: "")
+        put("parentSession", session.header.parentSession ?: "")
+    }
+
+    private fun payloadOf(session: SessionSession, event: SessionEvent): String {
+        val header = headerJson(session)
         val eventJson = buildJsonObject {
             put("type", event.type)
             put("seq", event.seq ?: -1L)
@@ -839,6 +1024,23 @@ class PluginResidentRuntime(
                         item.payload,
                         force = eventType == "turn/end" || eventType == "tool/result",
                     )
+                }
+
+                is QueueItem.AfterLoad -> {
+                    val startedAt = System.currentTimeMillis()
+                    val outcome = residency.session.dispatch("storage.afterLoad", item.payload, AFTER_LOAD_TIMEOUT_MS)
+                    val ms = System.currentTimeMillis() - startedAt
+                    val handled = runCatching {
+                        Json.parseToJsonElement(outcome.valueJson ?: "null").jsonObject["handled"]?.jsonPrimitive?.intOrNull
+                    }.getOrNull() ?: 0
+                    if (outcome.status == JsStatus.COMPLETED) {
+                        Log.i(TAG, "storage after-load plugin=${residency.record.id} handled=$handled ms=$ms")
+                        onAfterLoad(residency.record.id, true, null, ms)
+                    } else {
+                        addError(residency.record.id, "storage after-load 失败：${outcome.error ?: outcome.status}")
+                        Log.w(TAG, "storage after-load failed plugin=${residency.record.id} status=${outcome.status}")
+                        onAfterLoad(residency.record.id, false, outcome.error ?: outcome.status.toString(), ms)
+                    }
                 }
             }
         }
@@ -961,6 +1163,14 @@ class PluginResidentRuntime(
         val storages: List<String>,
         val prompts: List<String>,
         val capabilities: List<String>,
+        /** M87-A：工具中间件元数据（restrict/guard/describe 同步应用，钩子 dispatch 进 runtime）。 */
+        val toolMiddleware: ToolMiddlewareMeta,
+        /** M87-B：请求/提示词中间件元数据（闭包在 runtime 里，宿主按点 dispatch）。 */
+        val llmMiddleware: LlmMiddlewareMeta,
+        /** M87-E：会话写入钩子元数据（闭包在 runtime 里）。 */
+        val storageHooks: StorageHooksMeta,
+        /** M87-C：注册的插槽 id（`slot/id`）。 */
+        val slots: List<String>,
         val cleanups: Int,
         val error: String,
     )
@@ -998,6 +1208,14 @@ class PluginResidentRuntime(
                 (element as? JsonObject)?.get("id")?.let { runCatching { it.jsonPrimitive.content }.getOrNull() }
             }.orEmpty()
         }.getOrDefault(emptyList())
+        val slotIds = runCatching {
+            obj["slots"]?.jsonArray?.mapNotNull { element ->
+                val item = element as? JsonObject ?: return@mapNotNull null
+                val slot = item["slot"]?.let { runCatching { it.jsonPrimitive.content }.getOrNull() }
+                val id = item["id"]?.let { runCatching { it.jsonPrimitive.content }.getOrNull() }
+                if (slot.isNullOrBlank() || id.isNullOrBlank()) null else "$slot/$id"
+            }.orEmpty()
+        }.getOrDefault(emptyList())
         val capabilities = runCatching {
             obj["capabilities"]?.jsonArray?.mapNotNull { element ->
                 (element as? JsonObject)?.get("id")?.let { runCatching { it.jsonPrimitive.content }.getOrNull() }
@@ -1018,13 +1236,63 @@ class PluginResidentRuntime(
             storages,
             prompts,
             capabilities,
+            parseToolMiddleware(obj["toolMiddleware"] as? JsonObject),
+            parseLlmMiddleware(obj["llmMiddleware"] as? JsonObject),
+            parseStorageHooks(obj["storageHooks"] as? JsonObject),
+            slotIds,
             cleanups,
             errors.joinToString("\n").take(800),
         )
     }
 
-    /** 启动脚本返回的是「JSON 编码过的 JSON 字符串」：解两层。 */
-    private fun decodeJsonString(valueJson: String?): String? {
+    /** M87-A：解析常驻启动返回的 `toolMiddleware`（缺字段 = 没注册）。 */
+    private fun parseToolMiddleware(obj: JsonObject?): ToolMiddlewareMeta {
+        if (obj == null) return ToolMiddlewareMeta()
+        return runCatching {
+            ToolMiddlewareMeta(
+                active = obj["active"]?.jsonPrimitive?.content?.toBooleanStrictOrNull() == true,
+                restrict = obj["restrict"]?.jsonArray
+                    ?.mapNotNull { runCatching { it.jsonPrimitive.content }.getOrNull() }.orEmpty(),
+                guard = obj["guard"]?.jsonArray
+                    ?.mapNotNull { runCatching { it.jsonPrimitive.content }.getOrNull() }.orEmpty(),
+                describe = obj["describe"]?.jsonArray?.mapNotNull { element ->
+                    val item = element as? JsonObject ?: return@mapNotNull null
+                    val tool = item["tool"]?.jsonPrimitive?.content ?: return@mapNotNull null
+                    ToolDescribe(tool, item["patch"] as? JsonObject)
+                }.orEmpty(),
+                preExecute = obj["preExecute"]?.jsonPrimitive?.intOrNull ?: 0,
+                postExecute = obj["postExecute"]?.jsonPrimitive?.intOrNull ?: 0,
+                result = obj["result"]?.jsonPrimitive?.intOrNull ?: 0,
+            )
+        }.getOrDefault(ToolMiddlewareMeta())
+    }
+
+    /** M87-B：解析常驻启动返回的 `llmMiddleware`（缺字段 = 没注册）。 */
+    private fun parseLlmMiddleware(obj: JsonObject?): LlmMiddlewareMeta {
+        if (obj == null) return LlmMiddlewareMeta()
+        return runCatching {
+            LlmMiddlewareMeta(
+                active = obj["active"]?.jsonPrimitive?.content?.toBooleanStrictOrNull() == true,
+                request = obj["request"]?.jsonPrimitive?.intOrNull ?: 0,
+                assemble = obj["assemble"]?.jsonPrimitive?.intOrNull ?: 0,
+                stream = obj["stream"]?.jsonPrimitive?.intOrNull ?: 0,
+                preStep = obj["preStep"]?.jsonPrimitive?.intOrNull ?: 0,
+            )
+        }.getOrDefault(LlmMiddlewareMeta())
+    }
+
+    /** M87-E：解析常驻启动返回的 `storageHooks`（缺字段 = 没注册）。 */
+    private fun parseStorageHooks(obj: JsonObject?): StorageHooksMeta {
+        if (obj == null) return StorageHooksMeta()
+        return runCatching {
+            StorageHooksMeta(
+                beforeAppend = obj["beforeAppend"]?.jsonPrimitive?.intOrNull ?: 0,
+                afterLoad = obj["afterLoad"]?.jsonPrimitive?.intOrNull ?: 0,
+            )
+        }.getOrDefault(StorageHooksMeta())
+    }
+
+    /** 启动脚本返回的是「JSON 编码过的 JSON 字符串」：解两层。 */    private fun decodeJsonString(valueJson: String?): String? {
         val element = runCatching { Json.parseToJsonElement(valueJson ?: "null") }.getOrNull() ?: return null
         return runCatching { element.jsonPrimitive.content }.getOrNull()
     }
@@ -1038,6 +1306,8 @@ class PluginResidentRuntime(
         private const val TAG = "DshProjection"
         private const val RESIDENT_START_TIMEOUT_MS = 20_000L
         private const val DISPATCH_TIMEOUT_MS = 5_000L
+        /** M87-E：after-load 只观测，但允许插件做一点整理；给 3 秒，超时只记诊断。 */
+        private const val AFTER_LOAD_TIMEOUT_MS = 3_000L
         /** 插件 stream 回调可能很慢（等上游/算法）；给足 3 分钟，超时由 dispatch 中断。 */
         private const val PROVIDER_TIMEOUT_MS = 180_000L
         /** M84-N：checkpoint 落盘节流（同一插件两次快照至少隔这么久）。 */

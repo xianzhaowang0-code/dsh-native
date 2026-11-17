@@ -1,7 +1,7 @@
 ---
 name: dsh-plugin-authoring
-description: 为鲸歌 Android 原生版编写、适配、试运行、安装、启停和排查 JS 插件；覆盖工具、静态启动加载页、页面、Surface/WebView 整壳、回合、只读存储、提示词、模型供应商、能力提供方及事件投影。
-whenToUse: 用户要求「写插件」「AI 做插件并装测」「修改鲸歌界面/壳」「适配社区插件」「插件开发、安装或加载报错」时加载。
+description: 为鲸歌 Android 原生版编写、适配、试运行、安装、启停和排查 JS 插件；覆盖工具、工具/请求/存储中间件与事件钩子、UI 插槽、静态启动加载页、页面、Surface/WebView 整壳、回合、只读存储、提示词、模型供应商、能力提供方及事件投影。
+whenToUse: 用户要求「写插件」「AI 做插件并装测」「让 AI 授予/撤销插件权限、改配置、选角色」「修改鲸歌界面/壳」「适配社区插件」「插件开发、安装或加载报错」时加载。
 ---
 
 # 鲸歌原生插件开发与装测
@@ -31,12 +31,34 @@ whenToUse: 用户要求「写插件」「AI 做插件并装测」「修改鲸歌
 | `plugin_dev_call` | `{id:'whale-hello',tool:'whale_hello',args:{name:'鲸歌'}}` | 真实执行已启用且接入的插件工具，沿用参数校验、权限、超时与当前审批，可能产生副作用。 |
 | `plugin_dev_test_shell` | `{id:'whale-hello',shell:'hello-shell',action:'restore',value:{}}` | 临时运行真实 apply/mount/state/action，校验 Surface 树或非空 HTML；合成空会话，宿主命令只记录不执行，不切当前壳，也不证明实际画面已验收。单壳时可省 shell，action/value 可省。 |
 | `plugin_dev_test_capability` | `{capability:'hello.echo',args:{text:'你好'}}` | 真正调用已授权能力；不绕过提供方权限或超时，可能产生实际效果。 |
+| `plugin_dev_grant` | `{id:'whale-hello',permissions:['storage:hooks']}` 或 `{id,all:true}` | 授予清单里声明过、需要确认的权限（清单外/未实现的会被丢弃）；写审计并弹插件页「撤销」横幅；受「AI 全控制插件」开关约束。 |
+| `plugin_dev_revoke` | `{id,permissions:['storage:hooks']}` 或 `{id,all:true}` | 对称撤销；`all:true` 记 `revoke_all`（清空全部已授予项）。 |
+| `plugin_dev_config` | `{id:'whale-hello',config:{greeting:'嗨'}}` 或 `{id,reset:true}` | 按插件 Config schema 写入，不认识的键报错；`reset:true` 恢复默认；写审计。 |
+| `plugin_dev_role` | `{role:'shell',value:'native'}` / `{role:'model',value:'deepseek'}` | 切 `shell/loading/agent/storage/prompt/model` 六个角色之一；`value` 用角色候选的选择值：壳/回合/存储/提示词的内置实现写 `native`，加载页写 `builtin.loading.native`，模型写 `deepseek`/`openai`，第三方写插件 id 或 `插件id#实现id`；目标不可用时报「角色选择失败」。 |
+| `plugin_dev_middleware_state` | `{}` | 只读查「插件中间件总开关」当前状态（`on`/`off` + 说明），无审批、不写审计；扩展点插件没效果时先查它。 |
+| `plugin_dev_middleware` | `{enabled:true}` / `{enabled:false}` | 开关**插件中间件总开关**（全局旁路）。关着时所有扩展点钩子不生效、扩展点插件看起来没效果；写操作走审批并记审计。 |
 
 同 id 的 `install` 沿用重装语义：保留新 schema 兼容的用户配置，**保留原来的启用开关**（新装默认停用，不会因为重装被悄悄启用/停用），收回旧危险授权后须重新确认；`reload` 会保留新清单仍声明的已有授权。安装失败的回滚覆盖进程内异常，不代表断电或被系统杀进程时具备完整事务恢复。
 
-list/test 在现有只读审批名单；其余沿用现有写工具审批策略，ask 模式询问、auto 模式允许，不另加「每次都必须问」的规则。危险权限仍走插件页逐项授权；若因此无法完成实际功能验证，如实记录所缺授权，不修改授权表。
+list/test 在现有只读审批名单；其余沿用现有写工具审批策略，ask 模式询问、auto 模式允许，不另加「每次都必须问」的规则。危险权限默认走插件页逐项授权；需要 AI 代授时用 `plugin_dev_grant`（受「AI 全控制插件」开关、清单 sanitize、工具审批与审计约束，见下节），不要手改授权文件、不要绕审批。若因此无法完成实际功能验证，如实记录所缺授权。
 
 工具未暴露时用当前可用文件工具制作 zip，交付到鲸歌「包管理 → 插件 → 导入 zip」，使用插件详情里的试运行、启用、重载、授权和页面入口。不用桌面 `plugin_manager` / npm 命令替代原生安装。`plugin_dev_*` 返回的状态和限制优先于示例步骤。
+
+## 工具输入上限与显式错误（M88-G，0.3.5）
+
+模型侧每次工具调用的参数先过 `core:engine/ToolInputGuard`（按 UTF-8 字节）：普通工具 **64KB**（含插件工具，以及 `plugin_dev_call` 里嵌套的 `args`），`write`/`edit` **512KB**。超限、JSON 半截或非法时本次调用**不执行**，返回显式 error tool_result（「工具输入过长：N 字节 > 上限 M 字节」/「工具参数不是合法 JSON（可能被截断）」），回合继续，模型会拆小重试。插件工具别设计成必须一次塞超大 JSON：优先传文件路径、分页/分段参数；恰好 64KB 放行，中文按真实 UTF-8 字节算。
+
+## AI 全控制插件（M88-E，0.3.5）
+
+`plugin_dev_grant/revoke/config/role` 让 AI 直接改插件授权、配置和选中角色（用户明确要求，默认开）；`plugin_dev_middleware` 另管全局旁路开关。五层约束：
+
+- **总开关**：没有页面开关（默认开启）；若被关闭，所有插件控制工具都返回 `AI 插件控制已关闭：ai_plugin_control_disabled`，不改任何状态；遇到就如实告诉用户，不要重试或绕过。
+- **清单与审批**：`grant` 只授清单里声明过、且需要用户确认的权限（`all:true` = 全部声明项）；清单外/未实现的会被 `sanitizeGrants` 丢弃。系统权限（通知、Shizuku、无障碍、悬浮窗）仍只由系统弹窗授予——`grant notify` 只算插件声明通过，不等于拿到 Android `POST_NOTIFICATIONS`。调用仍走 `approval_mode`：ask 弹审批卡，auto 放行。
+- **审计与撤销**：每次操作追加到 `files/plugin-audit.jsonl`（`actor` 为 `ai`/`user`，`action` 为 `grant`/`revoke`/`revoke_all`/`config`/`role`/`middleware`，`target`/`detail`）；超过 512KB 轮转为 `.1`（保留一份，读回先旧后新）。插件页横幅「AI 已授予 <id>：<权限> · 撤销」，用户点撤销写入一条 `actor:"user"` 的 revoke；插件详情「最近操作（审计）」列最近 5 条，权限行标「已允许 · AI 授予」由审计回放得出（AI grant 加、任何来源的 revoke 减、revoke_all 清空）。
+- **中间件总开关（M88-I）**：**扩展点插件「没效果」时先想到这个**——关着时工具/请求/存储/事件钩子全部旁路（插槽照常），插件本身没坏。用 `plugin_dev_middleware_state` 查当前状态（只读），需要时用 `plugin_dev_middleware {enabled:true}` 打开（写工具，走审批并记审计）；这是全局开关，默认开，关它只用于排障，不要用改 prefs 等旁路。
+- **最小权限**：只授本次验证真正需要的项，优先逐项 `permissions`，少用 `all:true`；验证完把不用的撤销，并在交付说明里写清 AI 授予/撤销了什么。
+
+`plugin_dev_config` 按插件 Config schema 校验后写入（`PluginStore.setConfig`），`reset:true` 恢复默认；不认识的键会报错。`plugin_dev_role` 只切 `shell/loading/agent/storage/prompt/model` 六个角色；`value` 用「插件 → 角色」页候选的选择值——壳/回合/存储/提示词的内置实现写 `native`，加载页特殊为 `builtin.loading.native`，模型写 `deepseek`/`openai`（或 `builtin.model.*`），第三方写插件 id 或 `插件id#实现id`；写错/目标停用会返回「角色选择失败（原因见插件页提示）」，切角色本身不授予权限。四个工具同属 `builtin.plugin.dev` 组——「插件 → 内置 → 插件开发」关掉后它们与其它 `plugin_dev_*` 一起从工具表消失。
 
 ## 包与模块
 
@@ -112,7 +134,7 @@ return reply.body
 | agent | `ctx.agent.register({id:'hello.agent', label:'示例回合', async run(turn, api){ if(api.abort()) return {stopReason:'aborted',text:''}; api.status('处理…'); return {stopReason:'completed',text:'完成'} }})`；权限 `agent`。turn 含 turnId/sessionId/input/state；run 的第二参数只开放 notify/status/abort/tools.names 等当前宿主原语。 |
 | storage | `ctx.storage.register({id,label,list(){return [...]},load(id){return jsonlText}})`；权限 `storage`，v1 **只读**。list 返回会话摘要数组（含 id/title/updatedAt），load 返回会话 JSONL 字符串或 `{doc}`；需符合宿主会话格式。 |
 | model | `ctx.llm.register({id,label,protocol:'openai',baseUrl,model,apiKey})` 配置式接内置 OpenAI/Anthropic 通道；或提供 `stream(request, emit)` 自产回合，request 为统一 Anthropic 形状。不要在配置式例子里填真实密钥。 |
-| capability | `ctx.capability.register({id:'hello.echo',label:'回声',description:'返回输入',kind:'utility',invoke(args){return args}})`；权限 `capability`，返回 JSON 值或 `{ok:true,value}`，失败 `{ok:false,error}`。它注册实现，不自动获得 root/NFC/Shizuku/ADB 等底层权限；能力调用目前由插件页/调试宿主入口发起。 |
+| capability | `ctx.capability.register({id:'hello.echo',label:'回声',description:'返回输入',kind:'utility',invoke(args){return args}})`；权限 `capability`，返回 JSON 值或 `{ok:true,value}`，失败 `{ok:false,error}`。它注册实现，不自动获得 root/NFC/Shizuku/ADB 等底层权限；0.3.5 起模型可用 `capability` 工具按 id 调用（插件需启用且授予 `capability`），内置能力也可用 `capability`/`notify` 工具。 |
 
 agent 的 `api.tools.invoke`、`api.llm.stream`、`api.storage.append` 当前明确返回 `{ok:false,code:'UNSUPPORTED'}`，不能宣称实现完整自主工具回合。storage 无 create/append/save 写入契约，不能把 readOnly:false 变成写库。`ctx.storage.exportList()` / `exportLoad(sessionId)` 是带 storage 授权的内置会话只读导出原语，返回宿主信封；先检查 ok 再取 sessions/doc，不能把信封直接当 JSONL。
 
@@ -261,13 +283,90 @@ provide/inject 是跨插件 **JSON 快照**，不是共享函数/类/原生对�
 
 订阅用真实会话事件名（turn/start、turn/end、tool/result 等），或 session/event、*；回调 `(event,{name,sessionId,header})`。Host 对异步事件回调不等待，仅记异常；不要靠它建立必须完成的事务。已开启的会话会重放历史，副作用要处理重复投递。注册投影/订阅/effect/模型流/角色的启用插件可有常驻 runtime，停用/重载/删除先清理再关闭；工具 execute 仍是独立实例，别把两种状态生命周期混淆。effect 返回同步 cleanup，异步 cleanup 不阻塞关闭。
 
+## 0.3.5 中间件 / 插槽 / 存储钩子（M87-A~F）
+
+0.3.5 起新增四类「链式扩展点」和一个新权限 `storage:hooks`。共同纪律（docs/181 §3.1）：
+
+- 链顺序 = 插件清单顺序（= 启用顺序），同级再按注册先后；没有隐式优先级。中间件签名 `async (payload, next) => result`，不拥有决策时必须 `await next(...)` 并返回它的结果；返回 `null`/`undefined` = 放弃改写，继续链；抛异常 = 本中间件跳过并记 `DshExt` 诊断，不影响其它插件与主流程。
+- 单次 JS 往返预算 50ms；超时按跳过处理。工具/回合本身不受 50ms 限制。
+- 中间件只改「这一次请求/这一次工具结果」，**不改写会话历史**；工具结果改写时工具卡会标「已由 <插件> 改写」并记录原始哈希。
+- 插件页「扩展点」页签只列**已启用**插件：注册项、顺序、生效/缺授权/未常驻、本次进程的命中/异常/最近耗时；工具 `post-execute` 还展示 dispatch 前后 12 位 SHA-256。停用插件不出现（连「声明存在」占位也没有，搜索也搜不到——0.3.5 M88-A 起与角色页同一规则）；删除后「导入」列表、角色页、扩展点页签都不再出现；「内置」页签仍列停用项，可在那里重新打开。插件页「扩展点」页签顶部的「插件中间件总开关」可一键旁路工具/请求/存储/事件钩子（插槽与插件注册不受影响，用于排障）；AI 侧对应 `plugin_dev_middleware_state` 查状态、`plugin_dev_middleware` 开关（M88-I）。
+- 插件日志用 `console.log/info/warn/error`（宿主进 `DshProjection: resident <id> console:`）。**没有 `ctx.log`**；`ctx.logger` 是 no-op，不要用它当验收日志。
+
+### 工具内部（`tools:intercept` 只约束 describe/on）
+
+```js
+ctx.tools.restrict(['bash', 'shower_*'])                 // 只能删工具（同步，不需权限）
+ctx.tools.guard('bash', (call) => call.args.command.includes('rm -rf'))  // 同步拒绝
+ctx.tools.describe('bash', { description: '…', parameters: { … } })      // 改 schema，需 tools:intercept
+ctx.tools.on('pre-execute', async (call, next) => next({ ...call, args: mutate(call.args) }))
+ctx.tools.on('post-execute', async (res, next) => next({ ...res, text: res.text.replace('a', 'b') }))
+ctx.tools.on('result', (res) => { /* 只读观察 */ })
+```
+
+`restrict/guard` 只能收紧、不需要 `tools:intercept`；`describe/pre-execute/post-execute/result` 需要。`post-execute` v1 只改 `text`/`isError`，图片原样保留。guard 拒绝和 restrict 禁用都会落 `isError` 工具结果（工具卡红色）。
+
+### 请求 / 提示词内部（`llm:request`）
+
+```js
+ctx.on('system-prompt/assemble', async (prompt, next) => next(prompt.replace('旧段', '新段')))
+ctx.on('agent/request', async (req, next) => next({ ...req, model: 'deepseek-v4-pro' }))
+ctx.on('llm/stream', async (flow, next) => next(rewrite(flow)))
+ctx.on('agent/pre-step', async (step, next) => next({ ...step, inject: ['插件注入的一条 user 记录'] }))
+```
+
+`agent/request` 只改本次请求副本；`llm/stream` 改写会同时进 UI 与会话日志（模型看到的就是改写后的值）；`agent/pre-step` 只能注入、不能删本步消息。注意：step 1 的 `step.lastUserText` 可能取到宿主先落的技能目录通知，而不是用户原始输入；需要按原始输入判断时，在 `storage.on('before-append')` 里同步记标记（本仓 M87-E fixture 的做法）。
+
+### UI 插槽（`ui:slot`）
+
+```js
+ctx.ui.slots.register({
+  slot: 'chat.composer.dock', id: 'hello', order: 10, when: { session: 'any' },
+  tree: { type: 'row', gap: 8, children: [
+    { type: 'text', text: 'HELLO', color: 'sub' },
+    { type: 'button', text: '点我', onTap: 'hello/tap' },
+    { type: 'text', bind: 'state.hits', color: 'success' }
+  ] }
+})
+ctx.ui.slots.action('hello/tap', async (payload, host) => ({ state: { hits: Number(host.state.hits || 0) + 1 } }))
+```
+
+0.3.5 槽位：`chat.composer.dock`、`chat.node.tool`、`chat.node.assistant`、`chat.node.user`、`chat.message.actions`、`settings.rows`、`drawer.items`、`shell.overlay`。Surface 子树预算（≤64 节点/≤12 层/单文本≤2000/16 KiB）、只读 `state.*`/`view.*` 绑定、动作 id、主题 token、未知字段拒绝都沿用；`shell.overlay` 仍禁 `webview`/`image`。动作抛错只记 `slot action rejected`，UI 状态不变。插槽不受「插件中间件总开关」影响。
+
+### 存储 / 事件钩子（`storage:hooks`，危险权限）
+
+```js
+ctx.storage.on('before-append', async (event, next) => {
+  if (event.type === 'user/message' && JSON.stringify(event.data.content).includes('拒绝我')) {
+    return { allow: false, reason: '插件拒绝写入' }
+  }
+  return next(event)   // v1 只做观测 + 拒绝，不改写
+})
+ctx.storage.on('after-load', async (session) => {
+  console.log('after-load', session.sessionId, session.eventCount)
+})
+ctx.on('session/event', (e) => {
+  // 只对插件记录（source.kind=plugin-*，如 agent/pre-step 注入的 user/message）可 veto；
+  // 普通会话事件不可 veto。非 veto 分支必须 return undefined（return null 会被当成 veto）。
+  if (e.type === 'user/message' && e.data?.source?.kind === 'plugin-inject' &&
+      JSON.stringify(e.data.content).includes('VETO-ME')) return { veto: true, reason: '…' }
+  return undefined
+})
+```
+
+- `before-append` 只问 `user/message` 与 `tool/result`；拒绝的事件**不落盘、不占 seq**，UI 显示插件拒绝原因。工具结果被拒时宿主补一条 `isError:true` 的 trusted 结果保持 `tool_use/tool_result` 配对，模型看到的是宿主 fallback（「原始输出未落盘」），不是工具输出。
+- `after-load` 在打开会话、重放完已有事件后投递一次（有 checkpoint 先 restore），不是每条事件一次。
+- `session/event` 订阅者会收到落盘后的观察回调；对插件记录额外有一次落盘前的 veto 检查（所以同一记录可能被调两次）。停用/重载后钩子随常驻 runtime 撤下。
+- 总开关关闭时：before-append 连 gate 都不进、after-load 不投、`session/event` 不投递；插槽照常。
+
 ## 权限与不支持项
 
 - `fs:workspace`：按当前工作区解析，canonical 校验阻止越界；不是插件目录，也不是只读。`fs:any`：仍受 Android App 可访问范围限制。
 - `net:<域名>` 或 `net:any`：需宿主授权，仅 HTTPS，本机/链路本地等地址受限制，重定向逐跳检查。不要为通过测试擅自扩大到 net:any。
-- `shell`：需宿主危险权限确认，以 App 身份执行，不是 root；已授权后不会保证每条 shell 都再问一次。`device`/`memory` 同样沿用宿主权限与设备条件，声明不等于授权。
-- `ui`/`agent`/`storage`/`prompt`/`capability` 按当前宿主导入默认规则登记与授予，角色选择/调用还有各自条件。AI 不改 grantedPermissions 或绕开审批来装测。
-- 通知桥依宿主场景与 Android 通知条件工作；`notify` 权限在当前权限表仍标未实现，不能用 Notification.permission='granted' 占位值证明系统通知权限已取得。
+- `shell`：需宿主危险权限确认；执行时**自动选择身份：root 优先，其次 Shizuku，最后 App**（0.3.5 起 `root.exec` 已并入 `shell.exec`），返回的 `identity` 说明实际身份，不假装 root；已授权后不会保证每条 shell 都再问一次。`device`/`memory` 同样沿用宿主权限与设备条件，声明不等于授权。
+- **内置插件组可开关**：插件页「内置」页签每个内置插件都有开关，关掉即从工具表/页面入口注销。与插件相关：`builtin.plugin.dev`（「插件开发」，全部 `plugin_dev_*`，含 AI 控制四工具）、`builtin.capability`（「能力与通知」，`capability`/`notify`）、`builtin.web`（「联网」，`web_search`/`web_fetch`/`http_request`）、`builtin.fs`（`read`/`read_image`/`write`/`edit`/`glob`/`grep`）、`builtin.shell`（`bash`/终端）。模型侧 HTTP 用内置 `http_request`（只允许 http/https，不回显请求头与 `set-cookie`）；插件自己的网络仍走 `ctx.http` + `net:` 授权。若 `plugin_dev_*` 没出现在工具表，先确认「插件开发」组没被关。
+- `ui`/`agent`/`storage`/`prompt`/`capability` 按当前宿主导入默认规则登记与授予，角色选择/调用还有各自条件。0.3.5 新增的 `ui:slot`（插槽）、`tools:intercept`（改描述/参数/结果）、`llm:request`（改请求/流/提示词）、`storage:hooks`（写钩子/事件 veto）都是危险权限、默认需逐项确认、不自动授权；`restrict`/`guard` 只收紧，不需要 `tools:intercept`。AI 可经 `plugin_dev_grant/revoke` 改已声明授权（总开关 + 工具审批 + 审计，见 M88-E 节），但仍不能改系统权限或授权文件、不能绕过工具审批。
+- 通知桥依宿主场景与 Android 通知条件工作；`notify` 权限已实现（默认仍需确认），Android 13+ 还要系统 `POST_NOTIFICATIONS`。不能用 `Notification.permission='granted'` 占位值证明系统通知权限已取得。
 - UNSUPPORTED/NOT_SUPPORTED、未知能力、缺依赖、PERMISSION_DENIED 均应检查并如实报告。别用空结果当成功、换别的窗口冒充目标 UI，或用 stub 冒充设备原生能力。
 - QuickJS 与 App 同进程，是能力调用边界与超时控制，不是内核隔离。长任务避免同步死循环；不运行 npm lifecycle、不加载 DEX，不假设 Electron/桌面 helper 可运行。
 
@@ -275,9 +374,10 @@ provide/inject 是跨插件 **JSON 快照**，不是共享函数/类/原生对�
 
 - 工具：正确参数、缺参数/错误参数、真实 execute；注册不等于执行通过，工具数为零的页面/角色包也可能正常。
 - 权限：未授权时确实拒绝；已授权能力按预期；错误和超时可读，日志无凭据。试运行也会跑 apply，确认 apply 无安装/发网/删文件副作用。
+- AI 代授（用到时）：`plugin_dev_grant/revoke` 只授清单内权限、审计有记录、插件页横幅能撤销；关掉「AI 全控制插件」后四个工具返回 `ai_plugin_control_disabled`；系统权限仍由系统弹窗授予。
 - 生命周期：停用/重载后工具与角色撤下，cleanup 可用，重启/历史重放不重复产生外部副作用；升级保留可回退包。
 - UI：窄屏/宽屏、横竖屏、深浅色、中文长文本、键盘遮挡、可滚动/可点击、状态和错误可见；主界面保留停止与恢复原生壳入口，未授权审批和提问按真实用户操作处理。
 - 加载页：真实 registerLoading → list/test 元数据 → 安装选择 → 进程冷启动所选快照首 draw → 必需角色就绪 → 主界面；另验停用/坏声明/坏快照与失败恢复，记录每段耗时，不以静态登记通过宣称冷启动已验。
 - 分别报告「源码自检」「试运行」「安装启用」「实际功能/页面验证」完成程度；没执行的步骤不能写通过。
 
-源码核对入口（相对原生仓库根）：`core/plugins/.../PluginPackage.kt`、`PluginModule.kt`、`PluginSandbox.kt`、`PluginPermissions.kt`、`PluginServices.kt` 中 PluginCapabilities、`SurfaceSpec.kt`、`LoadingSpec.kt`、`PluginClientEntry.kt`；加载快照 `app/.../data/LoadingSnapshotStore.kt`，启动闸门与恢复 `app/.../ui/boot/BootHost.kt`、`BootLoadingScreen.kt`、`BootRecoveryPanel.kt`，常驻调度 `app/.../data/PluginResidentRuntime.kt`，页面桥 `app/src/main/assets/client-host/host.js`，整壳桥 `app/.../ui/surface/WebViewShellScreen.kt`。注释/旧技能与实际 dispatch 不一致时读实现确认，不能凭宽松 shim 推断能力。
+源码核对入口（相对原生仓库根）：`core/plugins/.../PluginPackage.kt`、`PluginModule.kt`、`PluginSandbox.kt`、`PluginPermissions.kt`、`PluginServices.kt` 中 PluginCapabilities、`SurfaceSpec.kt`、`LoadingSpec.kt`、`PluginClientEntry.kt`；加载快照 `app/.../data/LoadingSnapshotStore.kt`，启动闸门与恢复 `app/.../ui/boot/BootHost.kt`、`BootLoadingScreen.kt`、`BootRecoveryPanel.kt`，常驻调度 `app/.../data/PluginResidentRuntime.kt`，插件开发/AI 控制工具 `app/.../data/PluginDevTools.kt`、审计 `PluginAuditLog.kt`、内置组 `BuiltinPlugins.kt`，工具输入闸门 `core:engine/ToolInputGuard.kt`，页面桥 `app/src/main/assets/client-host/host.js`，整壳桥 `app/.../ui/surface/WebViewShellScreen.kt`。注释/旧技能与实际 dispatch 不一致时读实现确认，不能凭宽松 shim 推断能力。

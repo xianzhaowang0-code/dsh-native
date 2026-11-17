@@ -361,5 +361,52 @@
       "required": ["target_folder_path"],
       "additionalProperties": false
     }
+  },
+  {
+    "name": "capability",
+    "description": "Invoke a host or plugin capability by id. Built-in ids include notify, notify.toast, clipboard.read, clipboard.write, share, shell.exec and shell.status. Plugin capabilities require the plugin to be enabled and granted the capability permission; the runtime context lists the ids available in this session. Returns the capability's JSON value or an explicit error.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Capability id, for example notify, clipboard.read, shell.exec." },
+        "args": { "type": "object", "description": "Optional capability arguments as a JSON object; the shape depends on the capability." }
+      },
+      "required": ["id"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "notify",
+    "description": "Show a system notification with a title and/or body. Requires the Android notification permission; when it is off the tool returns an actionable error. For a non-persistent Toast use capability with id notify.toast.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "title": { "type": "string", "description": "Optional notification title." },
+        "body": { "type": "string", "description": "Notification body text." }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "http_request",
+    "description": "Send an HTTP request (GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS) to an http(s) URL and return a structured result: status, final url, response headers (set-cookie removed), body, byte count, truncation flag, content type and elapsed milliseconds. Non-text responses are returned as base64. Use it for APIs and curl-like calls; web_fetch is for readable page text.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "url": { "type": "string", "description": "Absolute http(s) URL." },
+        "method": { "type": "string", "description": "HTTP method, default GET." },
+        "headers": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Request headers; they are not echoed back in the result."
+        },
+        "body": { "type": "string", "description": "Request body for POST/PUT/PATCH/DELETE/OPTIONS." },
+        "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds (default 15000, max 60000)." },
+        "max_bytes": { "type": "integer", "description": "Max response bytes to read (default 262144, max 1048576); truncated=true when exceeded." },
+        "follow_redirects": { "type": "boolean", "description": "Follow up to 5 http(s) redirects (default true)." }
+      },
+      "required": ["url"],
+      "additionalProperties": false
+    }
   }
 ]

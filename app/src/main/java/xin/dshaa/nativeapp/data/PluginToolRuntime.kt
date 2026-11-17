@@ -230,6 +230,9 @@ class PluginToolRuntime(
                         return """{"ok":true}"""
                     }
                     if (method == "plugin.notify") {
+                        // M87-H5（docs/182）：notify 权限门——清单申请 + 用户确认才发；
+                        // 未授权返回结构化错误，不再静默成功/静默丢弃。
+                        notifyGate(binding)?.let { return it }
                         val payload = runCatching { Json.parseToJsonElement(payloadJson).jsonObject }.getOrNull()
                         val title = payload?.get("title")?.let { runCatching { it.jsonPrimitive.content }.getOrNull() }
                             ?: "插件通知"
@@ -308,8 +311,19 @@ class PluginToolRuntime(
         }
     }
 
-    /** 插件 `console.*` → logcat（限定长度，别让插件刷爆日志）。 */
-    private fun logPluginConsole(binding: Binding, payloadJson: String) {
+    /**
+     * M87-H5：`plugin.notify` 的权限门。返回 null = 放行；非 null = 给插件 JS 的结构化拒绝 JSON。
+     * 试运行（[refresh] 之外的 Binding）同样走这里，不会因为「只是试运行」就绕过授权。
+     */
+    private fun notifyGate(binding: Binding): String? {
+        if (PluginPermissions.notifyGranted(binding.permissions.map { it.raw }, binding.grantedPermissions)) {
+            return null
+        }
+        Log.w(TAG, "notify denied plugin=${binding.pluginId} tool=${binding.toolName}: notify permission not granted")
+        return PluginPermissions.NOTIFY_DENIED_JSON
+    }
+
+    /** 插件 `console.*` → logcat（限定长度，别让插件刷爆日志）。 */    private fun logPluginConsole(binding: Binding, payloadJson: String) {
         val payload = runCatching { Json.parseToJsonElement(payloadJson).jsonObject }.getOrNull() ?: return
         val level = payload["level"]?.let { runCatching { it.jsonPrimitive.content }.getOrNull() }.orEmpty()
         val message = payload["message"]?.let { runCatching { it.jsonPrimitive.content }.getOrNull() }.orEmpty()

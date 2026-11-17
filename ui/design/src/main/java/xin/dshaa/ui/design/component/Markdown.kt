@@ -147,43 +147,49 @@ fun MarkdownText(
 ) {
     val blocks = remember(text) { parseMarkdown(text) }
     val c = DshTheme2.colors
-    Column(modifier, verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        blocks.forEach { block ->
-            when (block) {
-                is MdBlock.Paragraph -> InlineText(block.text, style, color)
-                is MdBlock.Heading -> {
-                    val size = when (block.level) {
-                        1 -> 24.sp
-                        2 -> 21.sp
-                        3 -> 19.sp
-                        else -> 17.sp
+    // H6（docs/182）：选区容器上提到整条消息的**整列**，而不是每段各一个。
+    // Compose 以最内层 SelectionContainer 为选区边界，段内各包一层会导致「只能选一段、
+    // 往下拖不动」。这里包住所有块（段落/标题/列表/引用/代码/表格），同一消息内可连续选；
+    // 不跨消息（LazyColumn item 边界），避免和滚动/复用打架。
+    SelectionContainer {
+        Column(modifier, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            blocks.forEach { block ->
+                when (block) {
+                    is MdBlock.Paragraph -> InlineText(block.text, style, color)
+                    is MdBlock.Heading -> {
+                        val size = when (block.level) {
+                            1 -> 24.sp
+                            2 -> 21.sp
+                            3 -> 19.sp
+                            else -> 17.sp
+                        }
+                        InlineText(
+                            block.text,
+                            style.copy(fontSize = size, fontWeight = FontWeight.SemiBold, lineHeight = (size.value * 1.35f).sp),
+                            color,
+                        )
                     }
-                    InlineText(
-                        block.text,
-                        style.copy(fontSize = size, fontWeight = FontWeight.SemiBold, lineHeight = (size.value * 1.35f).sp),
-                        color,
-                    )
-                }
-                is MdBlock.Code -> CodeBlock(block.lang, block.code)
-                is MdBlock.Bullets -> Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    block.items.forEachIndexed { index, item ->
-                        Row {
-                            Text(
-                                if (block.ordered) "${index + 1}." else "•",
-                                style = style,
-                                color = c.faint,
-                                modifier = Modifier.width(22.dp),
-                            )
-                            InlineText(item, style, color, Modifier.weight(1f))
+                    is MdBlock.Code -> CodeBlock(block.lang, block.code)
+                    is MdBlock.Bullets -> Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        block.items.forEachIndexed { index, item ->
+                            Row {
+                                Text(
+                                    if (block.ordered) "${index + 1}." else "•",
+                                    style = style,
+                                    color = c.faint,
+                                    modifier = Modifier.width(22.dp),
+                                )
+                                InlineText(item, style, color, Modifier.weight(1f))
+                            }
                         }
                     }
+                    is MdBlock.Quote -> Row {
+                        Box(Modifier.width(3.dp).height(46.dp).clip(RoundedCornerShape(2.dp)).background(c.line))
+                        Spacer(Modifier.width(10.dp))
+                        InlineText(block.text, style, c.sub, Modifier.weight(1f))
+                    }
+                    is MdBlock.Table -> TableBlock(block.header, block.rows, c)
                 }
-                is MdBlock.Quote -> Row {
-                    Box(Modifier.width(3.dp).height(46.dp).clip(RoundedCornerShape(2.dp)).background(c.line))
-                    Spacer(Modifier.width(10.dp))
-                    InlineText(block.text, style, c.sub, Modifier.weight(1f))
-                }
-                is MdBlock.Table -> TableBlock(block.header, block.rows, c)
             }
         }
     }
@@ -243,20 +249,20 @@ private fun CodeBlock(lang: String, code: String) {
                 modifier = Modifier.padding(start = 14.dp, top = 8.dp),
             )
         }
-        SelectionContainer {
-            Text(
-                code,
-                style = MaterialTheme.typography.bodySmall.copy(
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 13.sp,
-                    lineHeight = 19.sp,
-                ),
-                color = Color(0xFFD7E2F3),
-                modifier = Modifier
-                    .horizontalScroll(rememberScrollState())
-                    .padding(horizontal = 14.dp, vertical = 10.dp),
-            )
-        }
+        // H6（docs/182）：这里不再套 SelectionContainer——最内层容器会切断跨段选区，
+        // 整条消息的选区容器由 MarkdownText 外层统一提供。
+        Text(
+            code,
+            style = MaterialTheme.typography.bodySmall.copy(
+                fontFamily = FontFamily.Monospace,
+                fontSize = 13.sp,
+                lineHeight = 19.sp,
+            ),
+            color = Color(0xFFD7E2F3),
+            modifier = Modifier
+                .horizontalScroll(rememberScrollState())
+                .padding(horizontal = 14.dp, vertical = 10.dp),
+        )
     }
 }
 
@@ -269,14 +275,14 @@ private fun InlineText(
     modifier: Modifier = Modifier,
 ) {
     val c = DshTheme2.colors
-    SelectionContainer {
-        Text(
-            annotated(text, style, color, c),
-            style = style,
-            color = color,
-            modifier = modifier,
-        )
-    }
+    // H6（docs/182）：**不要**在这里再包 SelectionContainer——Compose 以最内层容器为选区边界，
+    // 段内各包一层会让「一条消息只能选一段、往下拖不动」。整列的外层容器在 MarkdownText 里。
+    Text(
+        annotated(text, style, color, c),
+        style = style,
+        color = color,
+        modifier = modifier,
+    )
 }
 
 private fun annotated(text: String, style: TextStyle, color: Color, c: xin.dshaa.ui.design.theme.DshColors): AnnotatedString =

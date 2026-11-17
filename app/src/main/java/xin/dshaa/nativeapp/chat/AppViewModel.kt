@@ -47,7 +47,6 @@ import xin.dshaa.core.agent.AgentRouting
 import xin.dshaa.core.agent.BUILTIN_AGENT_ID
 import xin.dshaa.core.agent.ResolvedAgent
 import xin.dshaa.core.attachment.AttachmentStore
-import xin.dshaa.core.attachment.ImageNormalizer
 import xin.dshaa.core.engine.Compaction
 import xin.dshaa.core.engine.EngineDeps
 import xin.dshaa.core.engine.EngineHooks
@@ -60,6 +59,10 @@ import xin.dshaa.core.engine.TurnInput
 import xin.dshaa.core.engine.TurnOutcome
 import xin.dshaa.core.engine.TurnStopState
 import xin.dshaa.core.engine.TurnUi
+import xin.dshaa.core.engine.ToolMiddleware
+import xin.dshaa.core.engine.ToolMiddlewareChain
+import xin.dshaa.core.engine.RequestMiddleware
+import xin.dshaa.core.engine.RequestMiddlewareChain
 import xin.dshaa.core.engine.UserNotice
 import xin.dshaa.core.input.CommandInvocation
 import xin.dshaa.core.input.DSH_COMMANDS
@@ -122,8 +125,13 @@ import xin.dshaa.core.tools.workflow.WorkflowHost
 import xin.dshaa.core.tools.workflow.WorkflowToolOutcome
 import xin.dshaa.core.model.ToolCall
 import xin.dshaa.nativeapp.data.PluginShellHost
+import xin.dshaa.nativeapp.data.PluginToolMiddleware
+import xin.dshaa.nativeapp.data.PluginRequestMiddleware
+import xin.dshaa.nativeapp.data.TOOL_MIDDLEWARE_TIMEOUT_MS
 import xin.dshaa.core.parity.ParityJson
 import xin.dshaa.core.plugins.PluginRecord
+import xin.dshaa.core.plugins.PluginPermissions
+import xin.dshaa.core.plugins.PluginMiddlewareSwitch
 import xin.dshaa.core.plugins.PluginRoute
 import xin.dshaa.core.parity.RunRecorder
 import xin.dshaa.core.parity.SseCaptureRecorder
@@ -163,6 +171,11 @@ import xin.dshaa.core.session.SessionStore
 import xin.dshaa.core.session.SessionStores
 import xin.dshaa.core.session.TrashedSession
 import xin.dshaa.core.session.SessionSession
+import xin.dshaa.core.session.PendingSessionEvent
+import xin.dshaa.core.session.SessionAppendDecision
+import xin.dshaa.core.session.SessionAppendGate
+import xin.dshaa.core.session.SessionAppendVetoed
+import xin.dshaa.core.session.SessionWriteHooks
 import xin.dshaa.core.skill.FileSystemSkills
 import xin.dshaa.core.skill.SkillCatalog
 import xin.dshaa.core.skill.SkillFrontmatter
@@ -204,6 +217,14 @@ import xin.dshaa.nativeapp.device.tools.AndroidDeviceTools
 import xin.dshaa.nativeapp.memory.MemoryTools
 import xin.dshaa.nativeapp.device.tools.TerminalTools
 import xin.dshaa.ui.shellapi.NativeShellHost
+import xin.dshaa.ui.shellapi.SlotRegistry
+import xin.dshaa.ui.shellapi.PluginExtensionInput
+import xin.dshaa.ui.shellapi.PluginExtensionRows
+import xin.dshaa.ui.shellapi.PluginExtensionUi
+import xin.dshaa.ui.shellapi.PluginLlmExtensionInput
+import xin.dshaa.ui.shellapi.PluginSlotInput
+import xin.dshaa.ui.shellapi.PluginStorageExtensionInput
+import xin.dshaa.ui.shellapi.PluginToolExtensionInput
 import xin.dshaa.ui.shellapi.AgentTargetUi
 import xin.dshaa.ui.shellapi.RoleTargetUi
 import xin.dshaa.ui.shellapi.PluginPageEntry
@@ -214,6 +235,7 @@ import java.io.InputStream
 import java.time.ZoneId
 import java.util.UUID
 import xin.dshaa.ui.shellapi.chat.ATTACHMENT_REFERENCE_HINT
+import xin.dshaa.ui.shellapi.chat.CONTINUE_TRUNCATED_PROMPT
 import xin.dshaa.ui.shellapi.chat.ChatSessionState
 import xin.dshaa.ui.shellapi.chat.CommandSheet
 import xin.dshaa.ui.shellapi.chat.JobUi
@@ -224,7 +246,10 @@ import xin.dshaa.ui.shellapi.chat.READ_ONLY_IMPORT
 import xin.dshaa.ui.shellapi.chat.READ_ONLY_STORAGE
 import xin.dshaa.ui.shellapi.chat.READ_ONLY_SUBAGENT
 import xin.dshaa.ui.shellapi.chat.SessionBadge
+import xin.dshaa.ui.shellapi.chat.SharedPreferencesTruncationResumePreferences
 import xin.dshaa.ui.shellapi.chat.SubagentUi
+import xin.dshaa.ui.shellapi.chat.TruncationKind
+import xin.dshaa.ui.shellapi.chat.TruncationResumeStore
 import xin.dshaa.ui.shellapi.chat.WaitingSession
 import xin.dshaa.ui.shellapi.chat.buildJobRows
 import xin.dshaa.ui.shellapi.chat.mergeSubagents
@@ -245,6 +270,8 @@ private val READ_ONLY_TOOLS = setOf(
     "load_workspace_dependencies",
     // 技能加载：只读 SKILL.md，内容就是它自己的说明
     "skill", "plugin_dev_list", "plugin_dev_test",
+    // M88-I：中间件总开关状态查询是纯只读
+    "plugin_dev_middleware_state",
 )
 
 /** M85-D：第三方 JS 回合的最长等待（插件自己应尽快返回；超时按失败收尾，UI 可在 1.5s 后强制停）。 */
@@ -257,14 +284,30 @@ private const val PROMPT_ASSEMBLE_TIMEOUT_MS = 8_000L
  * 应用级状态：设置 + 会话仓库 + 当前聊天 + 工具循环。
  * 运行时暂时在 ViewModel；M2 后挪到前台服务持有的 ChatRuntimeHolder（01 §五.4）。
  */
-class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
+/** M87-C：插槽动作是用户主动点击，给比中间件宽松的预算（仍然有上限，超时只记诊断）。 */
+private const val SLOT_ACTION_TIMEOUT_MS = 500L
 
+/** M87-E：会话写入钩子在同步写路径上，单插件预算 50ms（超时放行 + 诊断，不能拖住落库）。 */
+private const val HOOK_TIMEOUT_MS = 50L
+
+class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
     // ---- 插件（M26：本地导入 + 试运行） ----
     //
     // 状态必须声明在 init 之前：init 里的调试导入（`--es dsh_plugin_zip`）会立刻读写它们。
     // 存储：`files/plugins/<id>/` + `files/plugins.json`。
 
     private val pluginStore = PluginStore(app)
+
+    /**
+     * M88-E（docs/183 §5）：插件操作审计（AI 授予/撤销/改配置/选角色）。
+     * 文件 `files/plugin-audit.jsonl`，512KB 轮转保留 1 份；插件详情展示最近 5 条。
+     */
+    private val pluginAuditLog = xin.dshaa.nativeapp.data.PluginAuditLog(
+        xin.dshaa.nativeapp.data.PluginAuditLog.fileIn(app.filesDir),
+    )
+
+    /** 本进程最近一次 AI 授予（插件 id → 权限），供横幅「撤销」使用。 */
+    private var lastAiGrant: Pair<String, Set<String>>? = null
 
     var runtimeReady by mutableStateOf(false)
         private set
@@ -383,6 +426,27 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
     override var pluginsUi by mutableStateOf(pluginStore.list())
         private set
 
+    // ---- M87-F：插件页「扩展点」诊断 / 中间的命中统计 ----
+    //
+    // 统计只进内存（重启清零），key = "pluginId\u0000phase"；页签打开时现算快照。
+    // 不假装有持久化：没有 dispatch 过就是「尚未命中」。
+    private data class ExtensionStat(
+        var hits: Long = 0,
+        var denies: Long = 0,
+        var errors: Long = 0,
+        var lastMs: Long = 0,
+        var lastError: String? = null,
+        var lastInHash: String? = null,
+        var lastOutHash: String? = null,
+    )
+
+    private val extensionStats = java.util.concurrent.ConcurrentHashMap<String, ExtensionStat>()
+
+    override var pluginExtensionsUi by mutableStateOf<List<PluginExtensionUi>>(emptyList())
+        private set
+
+    override val pluginMiddlewareEnabled: Boolean get() = settings.pluginMiddlewareEnabled
+
     // ---- M83 阶段 2：内置插件（工具/页面可单独开关） ----
     private val builtinStore = xin.dshaa.nativeapp.data.BuiltinPluginStore(app)
 
@@ -484,13 +548,46 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
         onResidentStarted = { pluginId ->
             Log.i("DshStorage", "resident started plugin=$pluginId -> refresh sessions")
             refreshSessions()
+            // M87-A：常驻运行时起来了才知道这个插件注册了哪些工具中间件，重建链。
+            rebuildPluginToolChain()
+            // M87-B：请求/提示词中间件同样要在 runtime 起来后重建（闭包在 runtime 里）。
+            rebuildPluginRequestChain()
+            // M87-C：插槽动作要 dispatch 进常驻 runtime；起来后再同步一次（幂等）。
+            syncPluginSlots()
         },
         // M85-E：只读导出器用的宿主导出原语（只读 builtin.storage.jsonl，不碰活动存储）。
         builtinSessionExport = { method, payload -> exportBuiltinSessions(method, payload) },
+        // M87-F：中间件总开关关闭时不再投递 session/event 观察与 after-load。
+        hooksEnabled = { PluginMiddlewareSwitch.enabled },
+        onAfterLoad = { pluginId, ok, error, ms ->
+            recordExtensionDispatch(pluginId, "storage.afterLoad", ok, error, ms)
+        },
     )
 
     /** 当前由插件注册进工具表的名字（刷新时先注销这一批，再按最新清单注册）。 */
     private val pluginToolNames = mutableSetOf<String>()
+
+    /**
+     * M87-A：工具中间件链快照（docs/181 §3.2）。
+     * 插件启用/停用/重载、或常驻运行时起来拿到注册元数据后重建；引擎每次请求/工具调用现取。
+     */
+    @Volatile
+    private var pluginToolChain: ToolMiddlewareChain = ToolMiddlewareChain.EMPTY
+
+    /**
+     * M87-B：请求/提示词中间件链快照（docs/181 §3.3）。
+     * 与工具链同一热换语义：插件启用/停用/重载或常驻运行时起来后重建，引擎每次请求/增量现取。
+     */
+    @Volatile
+    private var pluginRequestChain: RequestMiddlewareChain = RequestMiddlewareChain.EMPTY
+
+    /**
+     * M87-C：插件插槽注册表（原生壳在聊天输入条/工具卡/设置首页读取）。
+     * 只放「启用 + ui:slot 已授权」的声明；停用/删除/重载由 [syncPluginSlots] 立即摘掉。
+     */
+    val pluginSlotRegistry = SlotRegistry()
+
+    override val slotRegistry: SlotRegistry get() = pluginSlotRegistry
 
     /**
      * M85-A：壳宿主（只有用户选了插件壳时才会 mount）。state 由 [shellStateJson] 在主线程现算；
@@ -525,6 +622,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
         )
     }
 
+    /**
+     * M88-C（docs/183 §3）：能力进模型工具表——`capability {id,args?}` + `notify {title?,body}`。
+     * 归内置组 `builtin.capability`，随该组开关注册/注销（见 [syncBuiltinTools]）。
+     */
+    private val capabilityTools = xin.dshaa.nativeapp.device.tools.CapabilityTools(
+        invoke = { id, args -> capabilityHost.invoke(id, args) },
+        availableIds = { capabilityHost.ui().filter { it.available }.map { it.id } },
+        notificationsAllowed = { capabilityHost.notificationsAllowed() },
+    )
+
     /** 插件页底部最近一次能力调用的结果（null = 还没调用过）。 */
     override var capabilityNotice by mutableStateOf<String?>(null)
         private set
@@ -553,6 +660,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
 
     override val settings = SettingsStore(app.getSharedPreferences("dsh", 0))
     private val prefs = app.getSharedPreferences("dsh", 0)
+
+    /** H1：截断后「继续生成」的按会话标记（prefs，不进会话 JSONL）。 */
+    private val truncationResume = TruncationResumeStore(SharedPreferencesTruncationResumePreferences(prefs))
 
     /**
      * M85-A：当前由插件提供的整壳（null = 原生壳）。
@@ -739,17 +849,42 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
         }
     }, delete = { id, force ->
         deletePluginInternal(id, force)
-    })
+    }, aiPluginControlEnabled = { settings.aiPluginControl },
+        audit = { action, target, detail ->
+            pluginAuditLog.append(xin.dshaa.nativeapp.data.PluginAuditLog.ACTOR_AI, action, target, detail)
+        },
+        lastAiAction = { id -> pluginAuditLog.lastAiAction(id) },
+        selectRole = { role, value ->
+            // M88-E：六个角色复用现有选择路径（失败原因由各 select* 写 pluginNotice）。
+            when (role) {
+                "shell" -> selectShell(value)
+                "loading" -> selectLoading(value)
+                "agent" -> setActiveAgent(value)
+                "storage" -> setActiveStorage(value)
+                "prompt" -> setActivePrompt(value)
+                "model" -> setActiveModel(value)
+                else -> false
+            }
+        },
+        onAiGranted = { id, detail ->
+            lastAiGrant = id to detail.split('、').map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+            pluginNotice = "AI 已授予 $id：$detail · 撤销"
+        },
+        // M88-I：AI 可按需查/开关「插件中间件总开关」（查只读、开关走写工具审批与审计）。
+        middlewareEnabled = { settings.pluginMiddlewareEnabled },
+        setMiddlewareEnabled = { enabled -> setPluginMiddlewareEnabled(enabled) },
+    )
 
     private val registry: ToolRegistry =
-        ToolRegistry(androidDeviceTools.tools + terminalTools.tools + memoryTools.tools + pluginDevTools.tools)
+        ToolRegistry(androidDeviceTools.tools + terminalTools.tools + memoryTools.tools + pluginDevTools.tools + capabilityTools.tools)
 
     /**
-     * M84-F2：不属于 [xin.dshaa.core.tools.BuiltinToolCatalog] 的 app 工具（设备/终端/记忆），
+     * M84-F2：不属于 [xin.dshaa.core.tools.BuiltinToolCatalog] 的 app 工具（设备/终端/记忆/能力），
      * 也按内置插件组开关——关掉组 = 从 registry 注销，空壳 tools[] 才真的是 0。
      */
     private val appToolsByName =
-        (androidDeviceTools.tools + terminalTools.tools + memoryTools.tools + pluginDevTools.tools).associateBy { it.name }
+        (androidDeviceTools.tools + terminalTools.tools + memoryTools.tools + pluginDevTools.tools + capabilityTools.tools)
+            .associateBy { it.name }
 
     /**
      * M84-D：内置悬浮窗插口插件按开关注册/注销到 [FloatingSlots]。
@@ -996,6 +1131,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
         pluginResidentRuntime.valuesFor(current?.state?.sessionId)
 
     private fun initializeCoreRegistry() {
+        // M87-F：先按设置恢复插件中间件总开关（关 = 写入钩子/两条链/事件投递全旁路）。
+        syncPluginMiddlewareSwitch()
+        // M87-E：会话写入钩子（before-append / session-event veto）先装，第一次建会话就生效。
+        installSessionWriteHooks()
         registerBuiltinProviders()
         DebugProviders.install(prefs, xin.dshaa.nativeapp.BuildConfig.DEBUG)
         syncBuiltinTools()
@@ -1342,20 +1481,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
                 }
             }.getOrNull()
             val declared = runCatching { resolver.getType(uri) }.getOrNull()
-            val bytes = withContext(Dispatchers.IO) {
+            // M88-H：不按文件大小拒绝。先把 Uri 流式落到临时文件（分块写，不整读进内存），
+            // 再交给附件层流式归一化；临时文件处理完即删。
+            val error = withContext(Dispatchers.IO) {
                 runCatching {
-                    resolver.openInputStream(uri)?.use { readAtMost(it, (ImageNormalizer.MAX_SOURCE_BYTES + 1).toInt()) }
-                }.getOrNull()
+                    val temp = copyUriToTemp(uri)
+                    try {
+                        savePendingImageFile(state, temp, declared, name)
+                    } finally {
+                        temp.delete()
+                    }
+                }.getOrElse { "无法读取这张图片：${it.message ?: it.javaClass.simpleName}" }
             }
-            if (bytes == null) {
-                state.attachError = "无法读取这张图片"
-                return@launch
-            }
-            if (bytes.size > ImageNormalizer.MAX_SOURCE_BYTES) {
-                state.attachError = "图片超过 50MB，请先压缩"
-                return@launch
-            }
-            state.attachError = savePendingImage(state, bytes, declared, name)
+            state.attachError = error
         }
     }
 
@@ -1368,18 +1506,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
         val state = live.state
         state.attachError = null
         viewModelScope.launch {
-            val bytes = withContext(Dispatchers.IO) {
-                runCatching { file.inputStream().use { readAtMost(it, maxImageFileBytes + 1) } }.getOrNull().also { deleteCameraTemp(file) }
+            // M88-H：相机临时文件本来就是 File，直接交给附件层流式归一化（不整读、不限大小）。
+            val error = withContext(Dispatchers.IO) {
+                runCatching {
+                    if (!file.isFile || file.length() <= 0L) {
+                        "无法读取相机照片"
+                    } else {
+                        savePendingImageFile(state, file, null, file.name)
+                    }
+                }.getOrElse { "无法读取相机照片：${it.message ?: it.javaClass.simpleName}" }.also {
+                    deleteCameraTemp(file)
+                }
             }
-            if (bytes == null || bytes.isEmpty()) {
-                state.attachError = "无法读取相机照片"
-                return@launch
-            }
-            if (bytes.size > maxImageFileBytes) {
-                state.attachError = "图片超过 50MB，请先压缩"
-                return@launch
-            }
-            state.attachError = savePendingImage(state, bytes, null, file.name)
+            state.attachError = error
         }
     }
 
@@ -1435,11 +1574,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
         if (index >= 0) list.removeAt(index)
     }
 
-    /** 待发文件上限（单个）：超过就不读，直接提示。 */
+    /** 待发文件上限（单个，仅内联文本）：超过就走工作区路径引用，不拒绝。 */
     private val maxFileBytes = 512 * 1024
-    /** 图片/任意文件引用的上限（与 Operit 一样，文件只复制不解析）。 */
-    private val maxImageFileBytes = 50 * 1024 * 1024
-    private val maxAttachmentBytes = 50L * 1024 * 1024
     private val imageFileExts = setOf("png", "jpg", "jpeg", "webp", "gif")
 
     /** 认作文本的后缀（未知后缀再看内容像不像文本）。 */
@@ -1518,14 +1654,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
         val declared = runCatching { resolver.getType(uri) }.getOrNull()
         val ext = name.substringAfterLast('.', "").lowercase()
 
-        // 图片走原来的图片管线（模型直接看图）；上限 50MB，和 read_image 一致。
+        // 图片走原来的图片管线（模型直接看图）；M88-H：不按大小拒绝，流式落临时文件再归一化。
         if (declared?.startsWith("image/") == true || ext in imageFileExts) {
-            val bytes = runCatching {
-                resolver.openInputStream(uri)?.use { readAtMost(it, maxImageFileBytes + 1) }
-            }.getOrNull() ?: return "读取失败：$name"
-            if (bytes.isEmpty()) return "文件是空的：$name"
-            if (bytes.size > maxImageFileBytes) return "图片太大：$name（上限 50MB）"
-            return savePendingImage(state, bytes, declared, name)
+            val temp = runCatching { copyUriToTemp(uri) }.getOrElse { return "读取失败：$name（${it.message}）" }
+            return try {
+                savePendingImageFile(state, temp, declared, name)
+            } finally {
+                temp.delete()
+            }
         }
 
         // 非图片先探 512KB：确认是文本就内联；文本超限/二进制 → 复制到工作区做路径引用。
@@ -1582,16 +1718,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
         try {
             input.use { ins ->
                 target.outputStream().use { outs ->
-                    val buffer = ByteArray(64 * 1024)
-                    while (true) {
-                        val read = ins.read(buffer)
-                        if (read <= 0) break
-                        total += read
-                        if (total > maxAttachmentBytes) {
-                            error("文件太大（上限 ${maxAttachmentBytes / 1024 / 1024} MB）")
-                        }
-                        outs.write(buffer, 0, read)
-                    }
+                    // M88-H：文件引用不再设 50MB 上限，分块流式复制（不整读进内存）。
+                    val copied = xin.dshaa.nativeapp.data.AttachmentStreams.copy(ins, outs)
+                    total = copied
                     outs.fd.sync()
                 }
             }
@@ -1601,6 +1730,65 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
         } catch (e: Exception) {
             runCatching { target.delete() }
             throw e
+        }
+    }
+
+    /**
+     * M88-H：把 SAF Uri 分块复制到进程缓存临时文件（不整读进内存、不按大小拒绝）。
+     * 调用方负责在用完后删除；空文件抛错（由调用方翻成用户文案）。
+     */
+    private fun copyUriToTemp(uri: Uri): File {
+        val dir = File(getApplication<Application>().cacheDir, "incoming").apply { mkdirs() }
+        val temp = File.createTempFile("attach-", ".bin", dir)
+        try {
+            val input = getApplication<Application>().contentResolver.openInputStream(uri)
+                ?: error("读不到文件")
+            input.use { ins ->
+                temp.outputStream().use { outs ->
+                    val total = xin.dshaa.nativeapp.data.AttachmentStreams.copy(ins, outs)
+                    if (total == 0L) error("文件是空的")
+                    outs.fd.sync()
+                }
+            }
+            return temp
+        } catch (e: Throwable) {
+            temp.delete()
+            throw e
+        }
+    }
+
+    /**
+     * M88-H：图片的「文件入口」——只读 16 字节文件头嗅探格式，其余交给
+     * [AttachmentStore.saveImageFile] 流式归一化；源文件大小不限。
+     */
+    private suspend fun savePendingImageFile(
+        state: ChatSessionState,
+        file: File,
+        declared: String?,
+        name: String?,
+    ): String? {
+        val header = withContext(Dispatchers.IO) {
+            file.inputStream().use { input ->
+                val buffer = ByteArray(16)
+                val read = input.read(buffer)
+                if (read <= 0) ByteArray(0) else buffer.copyOf(read)
+            }
+        }
+        if (header.isEmpty()) return "文件是空的：${name ?: file.name}"
+        val mediaType = sniffImageMediaType(header)
+            ?: declared?.takeIf { it in setOf("image/png", "image/jpeg", "image/webp", "image/gif") }
+            ?: return "不支持的图片格式（支持 PNG/JPEG/WebP/GIF）"
+        return try {
+            val ref = withContext(Dispatchers.IO) { attachments.saveImageFile(file, mediaType, name) }
+            val path = attachments.imageFile(ref.attachmentId)?.absolutePath ?: return "附件写入失败"
+            withContext(Dispatchers.Main.immediate) {
+                if (attachmentLive(state) == null) "原会话已关闭，图片未添加"
+                else { state.pendingImages += PendingImage(ref, path); null }
+            }
+        } catch (e: ImageStoreException) {
+            imageStoreMessage(e)
+        } catch (e: Throwable) {
+            "图片处理失败：${e.message ?: e.javaClass.simpleName}"
         }
     }
 
@@ -1649,7 +1837,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
     /** 附件层稳定错误码 → 用户能看懂的一句话（read_image 工具用的是给模型的文案，这里面向人）。 */
     private fun imageStoreMessage(e: ImageStoreException): String = when (e.code) {
         ImageStoreException.Code.INVALID_IMAGE -> "这个文件不是可识别的图片"
-        ImageStoreException.Code.IMAGE_TOO_LARGE -> "图片太大（上限 50MB），请先压缩"
+        ImageStoreException.Code.IMAGE_TOO_LARGE -> "图片太大（无法压到可发送大小），请先缩小或转成 JPEG/PNG"
         ImageStoreException.Code.IMAGE_TOO_MANY_PIXELS -> "图片像素太大（上限 6400 万像素），请先缩小"
         ImageStoreException.Code.IMAGE_DIMENSION_TOO_LARGE -> "图片单边超过 65535px，请先缩小"
         ImageStoreException.Code.IMAGE_TYPE_MISMATCH -> "图片内容与格式不一致，可能已损坏"
@@ -1865,6 +2053,22 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
     override fun consumeDebugScreen() {
         debugScreenRequest = null
         settings.debugScreen = null
+    }
+
+    /**
+     * M87-H5：插件通知点击回到聊天落地页（用户拍板：只打开 App 聊天，不深链会话/插件页）。
+     * 每次请求自增；壳看到变化后清页面栈并 [consumeLandingChatRequest]。
+     */
+    override var landingChatRequest by mutableStateOf(0L)
+        private set
+
+    override fun consumeLandingChatRequest() {
+        landingChatRequest = 0L
+    }
+
+    /** MainActivity 收到 `PluginNotifier.ACTION_OPEN_CHAT` 时调用。 */
+    fun requestLandingChat() {
+        landingChatRequest += 1
     }
 
     /**
@@ -2297,6 +2501,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
                 plan = live.plan,
                 onPlanChanged = { syncPlanUiFor(live) },
                 hooks = turnHooks(live.state),
+                // M87-A：插件工具中间件链（每次请求现取快照；空链 = 零开销）。
+                toolMiddleware = { pluginToolChain },
+                // M87-B：插件请求/提示词中间件链（每次请求现取快照；空链 = 零开销）。
+                requestMiddleware = { pluginRequestChain },
                 claimSteeringInputs = { listOfNotNull(claimPrompt(live, steering = true)) },
                 nextQueuedInput = { claimPrompt(live) },
                 onInputDelivered = { id, seq -> ackPrompt(live, id, seq) },
@@ -2995,6 +3203,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
      * 其它会话的草稿、待发附件和返回栈一概不动。
      */
     private fun invalidateLivesForDeletedSession(id: String) {
+        // H1：会话没了，它的「继续生成」标记也一起清（回收站恢复/彻底删除共用）。
+        truncationResume.clear(id)
         val states = SessionLifecyclePolicy.runtimesForDeletedSession(
             lives.entries.associate { entry -> entry.key to entry.key.sessionId },
             id,
@@ -3268,6 +3478,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
         state.title = loaded.events.mapNotNull { SessionCodec.titleOf(it) }.lastOrNull()?.ifBlank { "会话" } ?: "会话"
         state.readOnly = loaded.readOnly || readOnlyReason != null
         state.readOnlyReason = readOnlyReason ?: if (loaded.readOnly) readOnlyReasonOf(loaded) else null
+        // H1：冷启/切会话后恢复「继续生成」入口（按会话 id 存在 prefs；只读会话不给）。
+        state.pendingContinue = if (state.readOnly) null else truncationResume.pending(loaded.header.id)
         if (withGoal) state.goal = runCatching { goalStore(loaded).current() }.getOrNull()
         // 压缩摘要的账本（M43）：checkpoint 消息的 source 只带 compactionId，条数/令牌在
         // compaction/summary 里；先折成「已压缩 N 条历史记录（约 T tokens）」给弹层当副标题。
@@ -4351,6 +4563,50 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
     }
 
     /**
+     * H1：按「最后一条 assistant 消息有没有 tool_use」区分截断类型。
+     * 工具批次的参数可能被切断（引擎一条都没执行），文案与纯文本截断不同。
+     */
+    private fun truncationKindOf(state: ChatSessionState): TruncationKind {
+        val last = state.messages.lastOrNull { it.role == MessageRole.ASSISTANT }
+        val hasToolCall = last?.content?.any { it.type == BlockType.TOOL_CALL } == true
+        return if (hasToolCall) TruncationKind.TOOL_CALL else TruncationKind.TEXT
+    }
+
+    /** H1：记下「这条会话还能继续生成」，冷启/切会话后由 prefs 回填。 */
+    private fun markTruncated(state: ChatSessionState, kind: TruncationKind = truncationKindOf(state)) {
+        state.pendingContinue = kind
+        val id = state.sessionId
+        if (id != null && !state.readOnly) truncationResume.mark(id, kind)
+        Log.i("DshTurn", "truncated turn: continue available session=${id ?: "-"} kind=$kind")
+    }
+
+    /** H1：清掉待续标记（新一轮开始 / 非截断收尾 / 会话删除）。 */
+    private fun clearTruncated(state: ChatSessionState) {
+        if (state.pendingContinue != null) state.pendingContinue = null
+        state.sessionId?.let { truncationResume.clear(it) }
+    }
+
+    /**
+     * H1：截断后「继续生成」——点一次消费一次（先清标记再发，连点/重放拿不到第二轮）；
+     * 以固定用户消息起新一轮。发送未被接受（只读/队列/安全提示）时还原标记，按钮不丢。
+     */
+    override fun continueTruncated(): Boolean {
+        val state = chat ?: return false
+        if (state.readOnly || state.streaming) return false
+        val kind = state.pendingContinue ?: return false
+        val id = state.sessionId
+        state.pendingContinue = null
+        if (id != null) truncationResume.clear(id)
+        Log.i("DshTurn", "continue truncated turn session=${id ?: "-"} kind=$kind")
+        if (!submit(CONTINUE_TRUNCATED_PROMPT)) {
+            state.pendingContinue = kind
+            if (id != null) truncationResume.mark(id, kind)
+            return false
+        }
+        return true
+    }
+
+    /**
      * 跑一轮，然后按 goal activation 决定要不要在 idle 点自动续轮（上游 goal-round-driver）。
      * 循环本身在 core:engine；这里只挂协程并收尾 UI 状态。
      */
@@ -4399,6 +4655,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
         // M85-B2-2：耗时从真正的 turn 起点算（不是等第一次流式回调），与 DshTurn 日志一致
         state.turnStartedAt = startedAt
         state.lastTurnDurationMs = 0L
+        // H1：新一轮开始就消费旧的「继续生成」标记；本轮若再次截断，收尾时会重新标记。
+        clearTruncated(state)
         markRunning(live)
         state.streaming = true
         live.stop.requested = false
@@ -4409,7 +4667,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
                 if (turnAgent.builtin) {
                     val outcome = live.engine.startTurn(ComposeTurnUi(state), input)
                     completedNormally = outcome == TurnOutcome.COMPLETED
-                    if (!completedNormally) pausePromptQueue(live, state.error ?: "本轮未正常完成，待发送消息已保留")
+                    if (outcome == TurnOutcome.MAX_TOKENS) {
+                        markTruncated(state)
+                        // H1（docs/182 第 5 条）：普通回合也明确「待发送消息已保留」，
+                        // 与插件回合路径（runPluginAgentTurn 的 max_tokens 文案）对齐。
+                        pausePromptQueue(live, "达到 max_tokens 上限，待发送消息已保留")
+                    } else if (!completedNormally) {
+                        pausePromptQueue(live, state.error ?: "本轮未正常完成，待发送消息已保留")
+                    }
                 } else {
                     var next: TurnInput? = input
                     while (next != null) {
@@ -4425,6 +4690,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
             } catch (e: CancellationException) {
                 pausePromptQueue(live, "已停止，待发送消息已保留")
                 throw e
+            } catch (e: SessionAppendVetoed) {
+                // M87-E：插件拒绝写入时，这条事件没落盘、也没有助手占位消息可挂错误文案，
+                // 把原因同时写进输入条上方的 attachError，用户能看到「拒绝写入」而不是静默丢失。
+                state.error = e.message ?: "插件拒绝写入会话"
+                state.attachError = state.error
+                pausePromptQueue(live, state.error ?: "插件拒绝写入会话")
+                Log.e("DshTurn", "turn append vetoed", e)
             } catch (e: Exception) {
                 state.error = e.message ?: "对话执行失败"
                 pausePromptQueue(live, state.error ?: "对话执行失败")
@@ -4595,7 +4867,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
                 error = error,
                 seq = assistantSeq,
             )
-            if (error != null) state.error = error
+            if (error != null) {
+                state.error = error
+                // H1：第三方回合插件也可能报 max_tokens；同样给「继续生成」入口（只能纯文本续写）。
+                if (reply?.stopReason == "max_tokens") markTruncated(state, TruncationKind.TEXT)
+            }
             withContext(Dispatchers.IO) {
                 session.endStep()
                 session.endTurn(
@@ -5960,7 +6236,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
 
     /**
      * 调试通道 `dsh_capability_test <路径>`：等常驻运行时后依次调用
-     * 内置能力（notify / clipboard.write / clipboard.read）、插件能力（nfc / adb-shell）
+     * 内置能力（notify / clipboard.write / clipboard.read / shell.status / shell.exec）与
+     * 插件能力（nfc / adb-shell）、一条已合并的 root.exec（应返回 merged_into_shell_exec）
      * 和一条故意不存在的能力，结果落盘。`share` 会弹系统面板，不放进自动验收。
      */
     override fun runCapabilityTest(dumpPath: String?) {
@@ -5971,6 +6248,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
                 Triple("notify", """{"title":"M85-F 能力验收","body":"builtin notify"}""", "内置通知"),
                 Triple("clipboard.write", """{"text":"M85F-CLIP"}""", "内置写剪贴板"),
                 Triple("clipboard.read", "{}", "内置读剪贴板"),
+                // M88-B：shell 身份 / shell 执行；root.exec 已并入 shell.exec，应返回结构化拒绝。
+                Triple("shell.status", "{}", "Shell 身份（只读）"),
+                Triple("shell.exec", """{"command":"echo M88B-SHELL; id"}""", "Shell 执行（root→Shizuku→App）"),
+                Triple("root.exec", """{"command":"id"}""", "root.exec 已合并（应返回 merged_into_shell_exec）"),
                 Triple("nfc", """{"action":"read"}""", "插件 NFC（演示）"),
                 Triple("adb-shell", """{"cmd":"id"}""", "插件 adb-shell（演示）"),
                 Triple("m85f.missing", "{}", "不存在的能力"),
@@ -6693,6 +6974,558 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
         refreshStorageResolution()
         refreshPromptResolution()
         refreshModelResolution()
+        // M87-A：插件启用/停用/重载后重建工具中间件链（常驻运行时起来后会再触发一次）。
+        rebuildPluginToolChain()
+        // M87-B：请求/提示词中间件链同理（同一个热换点）。
+        rebuildPluginRequestChain()
+        // M87-C：插件插槽（启用 + ui:slot 授权才算生效；停用即从注册表摘掉）。
+        syncPluginSlots()
+        // M87-F：插件清单/常驻元数据变了，扩展点快照跟着重算。
+        refreshPluginExtensions()
+    }
+
+    /**
+     * M87-A：按「启用中的插件 + 常驻运行时的注册元数据」重建工具中间件链。
+     *
+     * 链顺序 = 插件清单顺序（= 启用顺序，docs/181 §3.1 不引入隐式优先级）。
+     * 没有插件注册时回到 [ToolMiddlewareChain.EMPTY]（零开销、请求体与 0.3.4 一致）。
+     */
+    private fun rebuildPluginToolChain() {
+        val middlewares = ArrayList<ToolMiddleware>()
+        pluginsUi.filter { it.enabled }.forEach { record ->
+            val meta = pluginResidentRuntime.toolMiddlewareOf(record.id) ?: return@forEach
+            if (meta.isEmpty) return@forEach
+            val interceptGranted = PluginPermissions.toolsInterceptGranted(
+                record.permissions,
+                record.grantedPermissions,
+            )
+            if (meta.hasHooks && !interceptGranted) {
+                Log.w("DshExt", "tools:intercept not granted plugin=${record.id}; hooks disabled (restrict/guard still allowed)")
+            }
+            middlewares += PluginToolMiddleware(
+                pluginId = record.id,
+                pluginName = record.name,
+                meta = meta,
+                interceptGranted = interceptGranted,
+                dispatch = { method, payload -> dispatchPluginToolMiddleware(record.id, method, payload) },
+                scope = viewModelScope,
+                log = { message -> Log.i("DshExt", message) },
+            )
+        }
+        val chain = if (middlewares.isEmpty()) {
+            ToolMiddlewareChain.EMPTY
+        } else {
+            ToolMiddlewareChain(
+                middlewares,
+                onDiagnostic = { diagnostic ->
+                    Log.w(
+                        "DshExt",
+                        "middleware=${diagnostic.middlewareId} phase=${diagnostic.phase} error=${diagnostic.error}",
+                    )
+                },
+            )
+        }
+        // M87-F：总开关关闭时整条链旁路（插件清单/常驻运行时不动，打开即恢复）。
+        pluginToolChain = PluginMiddlewareSwitch.bypass(chain, ToolMiddlewareChain.EMPTY)
+        if (!PluginMiddlewareSwitch.enabled) {
+            if (!chain.isEmpty) Log.i("DshExt", "tool middleware chain bypassed (switch off) size=${chain.size}")
+        } else if (!chain.isEmpty) {
+            Log.i(
+                "DshExt",
+                "tool middleware chain rebuilt size=${chain.size} ids=${chain.ids.joinToString(",")}",
+            )
+        }
+        refreshPluginExtensions()
+    }
+
+    /** M87-A：宿主 → 常驻运行时的一次中间件 dispatch（50ms 预算；失败只记诊断，不打断回合）。 */
+    private fun dispatchPluginToolMiddleware(pluginId: String, method: String, payload: String): String? {
+        val startedAt = System.currentTimeMillis()
+        val outcome = pluginResidentRuntime.dispatch(pluginId, method, payload, TOOL_MIDDLEWARE_TIMEOUT_MS)
+        val ms = System.currentTimeMillis() - startedAt
+        if (outcome == null || outcome.status != JsStatus.COMPLETED) {
+            Log.w(
+                "DshExt",
+                "middleware dispatch failed plugin=$pluginId method=$method " +
+                    "status=${outcome?.status ?: "NOT_RESIDENT"} error=${outcome?.error ?: "-"}",
+            )
+            recordExtensionDispatch(
+                pluginId, method, ok = false,
+                error = outcome?.error ?: outcome?.status?.name ?: "NOT_RESIDENT", ms = ms,
+            )
+            return null
+        }
+        recordExtensionDispatch(
+            pluginId, method, ok = true, error = null, ms = ms,
+            payload = payload.takeIf { method == "tools.postExecute" },
+            reply = outcome.valueJson.takeIf { method == "tools.postExecute" },
+        )
+        return outcome.valueJson
+    }
+
+    /**
+     * M87-B：按「启用中的插件 + 常驻运行时的注册元数据」重建请求/提示词中间件链。
+     *
+     * 链顺序 = 插件清单顺序（= 启用顺序，docs/181 §3.1）。没有插件注册时回到
+     * [RequestMiddlewareChain.EMPTY]（零开销、请求体/system 与 0.3.4 逐字节相同）。
+     * 申请了 `llm:request` 但没授权的插件不挂链（日志与插件页可见，不静默生效）。
+     */
+    private fun rebuildPluginRequestChain() {
+        val middlewares = ArrayList<RequestMiddleware>()
+        pluginsUi.filter { it.enabled }.forEach { record ->
+            val meta = pluginResidentRuntime.llmMiddlewareOf(record.id) ?: return@forEach
+            if (meta.isEmpty) return@forEach
+            val granted = PluginPermissions.llmRequestGranted(
+                record.permissions,
+                record.grantedPermissions,
+            )
+            if (!granted) {
+                Log.w(
+                    "DshExt",
+                    "llm:request not granted plugin=${record.id}; request middleware disabled",
+                )
+                return@forEach
+            }
+            middlewares += PluginRequestMiddleware(
+                pluginId = record.id,
+                pluginName = record.name,
+                meta = meta,
+                granted = true,
+                dispatch = { method, payload -> dispatchPluginRequestMiddleware(record.id, method, payload) },
+                log = { message -> Log.i("DshExt", message) },
+            )
+        }
+        val chain = if (middlewares.isEmpty()) {
+            RequestMiddlewareChain.EMPTY
+        } else {
+            RequestMiddlewareChain(
+                middlewares,
+                onDiagnostic = { diagnostic ->
+                    Log.w(
+                        "DshExt",
+                        "middleware=${diagnostic.middlewareId} phase=${diagnostic.phase} error=${diagnostic.error}",
+                    )
+                },
+            )
+        }
+        // M87-F：总开关关闭时整条链旁路。
+        pluginRequestChain = PluginMiddlewareSwitch.bypass(chain, RequestMiddlewareChain.EMPTY)
+        if (!PluginMiddlewareSwitch.enabled) {
+            if (!chain.isEmpty) Log.i("DshExt", "request middleware chain bypassed (switch off) size=${chain.size}")
+        } else if (!chain.isEmpty) {
+            Log.i(
+                "DshExt",
+                "request middleware chain rebuilt size=${chain.size} ids=${chain.ids.joinToString(",")}",
+            )
+        }
+        refreshPluginExtensions()
+    }
+
+    /** M87-B：宿主 → 常驻运行时的一次请求中间件 dispatch（50ms 预算；失败只记诊断）。 */
+    private fun dispatchPluginRequestMiddleware(pluginId: String, method: String, payload: String): String? {
+        val startedAt = System.currentTimeMillis()
+        val outcome = pluginResidentRuntime.dispatch(pluginId, method, payload, PluginRequestMiddleware.TIMEOUT_MS)
+        val ms = System.currentTimeMillis() - startedAt
+        if (outcome == null || outcome.status != JsStatus.COMPLETED) {
+            Log.w(
+                "DshExt",
+                "request middleware dispatch failed plugin=$pluginId method=$method " +
+                    "status=${outcome?.status ?: "NOT_RESIDENT"} error=${outcome?.error ?: "-"}",
+            )
+            recordExtensionDispatch(
+                pluginId, method, ok = false,
+                error = outcome?.error ?: outcome?.status?.name ?: "NOT_RESIDENT", ms = ms,
+            )
+            return null
+        }
+        recordExtensionDispatch(pluginId, method, ok = true, error = null, ms = ms)
+        return outcome.valueJson
+    }
+
+    // ---- M87-F：扩展点诊断（设置里的总开关 + 插件页「扩展点」页签） ----
+
+    /**
+     * M87-F：设置里的「插件中间件」总开关。
+     *
+     * 关掉：工具链/请求链换成空链、写入钩子整条旁路（`SessionWriteHooks.bypass`）、
+     * 常驻运行时不再投递 `session/event` 与 after-load；插槽/工具注册不受影响。
+     * 打开：按当前插件清单重建两条链，写入钩子恢复。两个方向都立即生效（不用重启）。
+     */
+    override fun setPluginMiddlewareEnabled(enabled: Boolean) {
+        settings.setPluginMiddlewareEnabled(enabled)
+        PluginMiddlewareSwitch.set(enabled)
+        SessionWriteHooks.bypass = !enabled
+        rebuildPluginToolChain()
+        rebuildPluginRequestChain()
+        refreshPluginExtensions()
+        pluginNotice = if (enabled) {
+            "插件中间件已开启"
+        } else {
+            "插件中间件已关闭：工具/请求/存储/事件钩子已旁路（插槽与插件注册不受影响）"
+        }
+        Log.i(
+            "DshExt",
+            "plugin middleware switch enabled=$enabled toolChain=${pluginToolChain.size} " +
+                "requestChain=${pluginRequestChain.size} sessionHooksBypass=${SessionWriteHooks.bypass}",
+        )
+    }
+
+    /** M87-F：记一次 dispatch 结果（命中/异常/最近耗时；payload/reply 非空时记前置/后置 SHA-256）。 */
+    private fun recordExtensionDispatch(
+        pluginId: String,
+        phase: String,
+        ok: Boolean,
+        error: String?,
+        ms: Long,
+        payload: String? = null,
+        reply: String? = null,
+    ) {
+        val stat = extensionStats.getOrPut("$pluginId\u0000$phase") { ExtensionStat() }
+        synchronized(stat) {
+            if (ok) {
+                stat.hits++
+            } else {
+                stat.errors++
+                stat.lastError = error ?: "运行时不可用/超时"
+            }
+            stat.lastMs = ms
+            payload?.let { stat.lastInHash = sha256Short(it) }
+            reply?.let { stat.lastOutHash = sha256Short(it) }
+        }
+    }
+
+    /** M87-F：记一次拒绝（veto / guard），拒绝也是一次命中。 */
+    private fun recordExtensionDeny(pluginId: String, phase: String, reason: String, ms: Long) {
+        val stat = extensionStats.getOrPut("$pluginId\u0000$phase") { ExtensionStat() }
+        synchronized(stat) {
+            stat.hits++
+            stat.denies++
+            stat.lastMs = ms
+            stat.lastError = reason
+        }
+    }
+
+    /** 改写诊断用的短哈希（前 12 个十六进制字符；只证明「变了」，不泄露正文）。 */
+    private fun sha256Short(text: String?): String? {
+        if (text.isNullOrEmpty()) return null
+        return runCatching {
+            java.security.MessageDigest.getInstance("SHA-256")
+                .digest(text.toByteArray(Charsets.UTF_8))
+                .joinToString("") { "%02x".format(it) }
+                .take(12)
+        }.getOrNull()
+    }
+
+    /**
+     * M88-A：按插件清单顺序生成「扩展点」快照。
+     *
+     * 数据源只有宿主已经拿到的：`PluginRecord` 声明 + 常驻运行时注册元数据 + 本进程命中统计。
+     * 停用插件**不出现**（与角色页同一规则）；启用但未常驻的插件保留「未常驻」提示，不冒充生效。
+     * 行构造是 `ui:shell-api` 的纯函数 [PluginExtensionRows.build]（JVM 可测）。
+     */
+    override fun refreshPluginExtensions() {
+        val inputs = pluginsUi.map { record ->
+            val toolMeta = pluginResidentRuntime.toolMiddlewareOf(record.id)
+            val llmMeta = pluginResidentRuntime.llmMiddlewareOf(record.id)
+            val storageMeta = pluginResidentRuntime.storageHooksOf(record.id)
+            PluginExtensionInput(
+                pluginId = record.id,
+                pluginName = record.name,
+                enabled = record.enabled,
+                permissions = record.permissions,
+                grantedPermissions = record.grantedPermissions,
+                toolMiddleware = record.toolMiddleware,
+                llmMiddleware = record.llmMiddleware,
+                storageHooks = record.storageHooks,
+                slots = record.slots.map { PluginSlotInput(it.slot, it.id, it.order) },
+                tool = toolMeta?.let {
+                    PluginToolExtensionInput(
+                        restrict = it.restrict,
+                        guard = it.guard,
+                        describe = it.describe.map { patch -> patch.tool },
+                        preExecute = it.preExecute,
+                        postExecute = it.postExecute,
+                        result = it.result,
+                    )
+                },
+                llm = llmMeta?.let {
+                    PluginLlmExtensionInput(
+                        assemble = it.assemble,
+                        request = it.request,
+                        stream = it.stream,
+                        preStep = it.preStep,
+                    )
+                },
+                storage = storageMeta?.let {
+                    PluginStorageExtensionInput(
+                        beforeAppend = it.beforeAppend,
+                        afterLoad = it.afterLoad,
+                        subscriptions = pluginResidentRuntime.subscriptionsOf(record.id),
+                    )
+                },
+            )
+        }
+        pluginExtensionsUi = PluginExtensionRows.build(
+            inputs = inputs,
+            switchOn = PluginMiddlewareSwitch.enabled,
+            stats = { pluginId, phase, hashes -> statsText(pluginId, phase, hashes) },
+        )
+    }
+
+    /** M87-F：把某条链的统计格式化成一行（无数据就说「尚未命中」，不编数）。 */
+    private fun statsText(pluginId: String, phase: String, hashes: Boolean = false): String {
+        val stat = extensionStats["$pluginId\u0000$phase"] ?: return "尚未命中（本次进程）"
+        return buildString {
+            append("命中 ${stat.hits}")
+            if (stat.denies > 0) append(" · 拒绝 ${stat.denies}")
+            append(" · 异常 ${stat.errors}")
+            append(" · 最近 ${stat.lastMs}ms")
+            if (hashes && stat.lastInHash != null) {
+                append(" · 哈希 ${stat.lastInHash}→${stat.lastOutHash ?: "-"}")
+            }
+        }
+    }
+
+
+    /**
+     * M87-C：按「启用 + ui:slot 已授权」把插件声明同步进原生壳的插槽注册表。
+     *
+     * 顺序 = 插件清单顺序（`pluginsUi` 顺序），槽位内部再按 `order`；停用/删除/取消授权后
+     * 立即从注册表摘掉（`removePlugin`），原生页面于是恢复原样（不会留白块）。
+     * `state.*` 绑定只读插件动作返回值；`view.*` 绑定到该插件当前会话的投影 `wire.view`。
+     */
+    private fun syncPluginSlots() {
+        val registry = pluginSlotRegistry
+        registry.viewResolver = resolver@ { pluginId, path ->
+            val sid = conversation.state?.sessionId?.takeIf { it.isNotBlank() } ?: return@resolver null
+            val key = path.substringBefore('.')
+            pluginResidentRuntime.valuesFor(sid)
+                .firstOrNull { it.pluginId == pluginId && it.key == key }
+                ?.viewJson
+        }
+        registry.actionHandler = { entry, action, payload ->
+            dispatchPluginSlotAction(entry, action, payload)
+        }
+        val active = HashSet<String>()
+        pluginsUi.filter { it.enabled }.forEach { record ->
+            if (record.slots.isEmpty()) return@forEach
+            if (!PluginPermissions.uiSlotGranted(record.permissions, record.grantedPermissions)) {
+                Log.w("DshExt", "ui:slot not granted plugin=${record.id}; slots disabled")
+                return@forEach
+            }
+            active += record.id
+            registry.syncPlugin(record.id, record.name, record.slots)
+        }
+        // 已经不在「启用 + 授权」集合里的插件：清掉残留（停用/删除/取消授权）。
+        registry.all().map { it.pluginId }.distinct().filter { it !in active }.forEach { registry.removePlugin(it) }
+        if (active.isNotEmpty()) {
+            Log.i("DshExt", "slot registry synced plugins=${active.joinToString(",")} entries=${registry.all().size}")
+        }
+    }
+
+    /** M87-C：一次插槽动作 dispatch（用户点击；500ms 预算；失败只记诊断，不影响其它条目）。 */
+    private fun dispatchPluginSlotAction(entry: SlotRegistry.Entry, action: String, payloadJson: String?) {
+        val stateJson = pluginSlotRegistry.fresh(entry)?.stateJson ?: entry.stateJson
+        val body = buildJsonObject {
+            put("action", action)
+            put("slot", entry.slot.slot)
+            put("id", entry.slot.id)
+            put("state", runCatching { Json.parseToJsonElement(stateJson) }.getOrElse { buildJsonObject { } })
+            payloadJson?.let { raw ->
+                runCatching { put("payload", Json.parseToJsonElement(raw)) }
+            }
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            val outcome = pluginResidentRuntime.dispatch(
+                entry.pluginId,
+                "ui.slot.action",
+                body.toString(),
+                SLOT_ACTION_TIMEOUT_MS,
+            )
+            if (outcome == null || outcome.status != JsStatus.COMPLETED) {
+                Log.w(
+                    "DshExt",
+                    "slot action failed plugin=${entry.pluginId} slot=${entry.slot.key} action=$action " +
+                        "status=${outcome?.status ?: "NOT_RESIDENT"} error=${outcome?.error ?: "-"}",
+                )
+                return@launch
+            }
+            val reply = runCatching { Json.parseToJsonElement(outcome.valueJson ?: "null").jsonObject }.getOrNull()
+            if (reply == null || reply["ok"]?.jsonPrimitive?.content?.toBooleanStrictOrNull() == false) {
+                Log.w(
+                    "DshExt",
+                    "slot action rejected plugin=${entry.pluginId} slot=${entry.slot.key} action=$action " +
+                        "error=${reply?.get("error")?.jsonPrimitive?.contentOrNull ?: "bad-json"}",
+                )
+                return@launch
+            }
+            val next = reply["state"] as? JsonObject ?: return@launch
+            val updated = pluginSlotRegistry.updateState(entry.pluginId, entry.slot.key, next.toString())
+            Log.i(
+                "DshExt",
+                "slot action ok plugin=${entry.pluginId} slot=${entry.slot.key} action=$action updated=$updated",
+            )
+        }
+    }
+
+    /**
+     * M87-E（docs/181 §3.5）：安装会话写入钩子。
+     *
+     * 两层：
+     * 1. `storage:hooks` 插件的 `before-append`：可拒绝 user/message、tool/result 落盘；
+     * 2. `session/event` 订阅者对**插件记录**（`source.kind=plugin-*`）的 veto：普通会话事件不可 veto。
+     *
+     * 钩子由 [SessionSession.appendRaw] 在同步写路径上调用；实现方必须快速返回（单插件 50ms），
+     * 超时/异常一律放行并记 `DshExt` 诊断，不能让插件故障阻塞会话落库。
+     */
+    private fun installSessionWriteHooks() {
+        if (SessionWriteHooks.gate != null) return
+        SessionWriteHooks.gate = object : SessionAppendGate {
+            override fun beforeAppend(event: PendingSessionEvent): SessionAppendDecision =
+                if (PluginMiddlewareSwitch.enabled) evaluateAppendHooks(event) else SessionAppendDecision()
+        }
+        Log.i("DshExt", "session write hooks installed (storage:hooks + plugin-record veto)")
+    }
+
+    /**
+     * M87-F：把设置里的「插件中间件」总开关同步到进程级开关。
+     * `PluginMiddlewareSwitch` 负责工具/请求链与事件投递；`SessionWriteHooks.bypass` 负责写钩子。
+     */
+    private fun syncPluginMiddlewareSwitch() {
+        PluginMiddlewareSwitch.set(settings.pluginMiddlewareEnabled)
+        SessionWriteHooks.bypass = !PluginMiddlewareSwitch.enabled
+        Log.i(
+            "DshExt",
+            "plugin middleware switch enabled=${PluginMiddlewareSwitch.enabled} " +
+                "sessionHooksBypass=${SessionWriteHooks.bypass}",
+        )
+    }
+
+    private fun evaluateAppendHooks(event: PendingSessionEvent): SessionAppendDecision {
+        val storage = dispatchStorageBeforeAppend(event)
+        if (!storage.allow) return storage
+        // session/event 只对插件记录（插件注入的 user/message）开放 veto；普通事件不允许。
+        if (event.pluginRecord) return dispatchPluginRecordVeto(event)
+        return SessionAppendDecision()
+    }
+
+    /** `storage:hooks` 的 before-append：按插件清单顺序问，第一个拒绝生效。 */
+    private fun dispatchStorageBeforeAppend(event: PendingSessionEvent): SessionAppendDecision {
+        val candidates = pluginsUi.filter { record ->
+            record.enabled && record.storageHooks &&
+                PluginPermissions.storageHooksGranted(record.permissions, record.grantedPermissions) &&
+                (pluginResidentRuntime.storageHooksOf(record.id)?.beforeAppend ?: 0) > 0
+        }
+        if (candidates.isEmpty()) return SessionAppendDecision()
+        val data = runCatching { Json.parseToJsonElement(event.dataJson) }.getOrNull()
+            ?: return SessionAppendDecision()
+        val payload = buildJsonObject {
+            put(
+                "event",
+                buildJsonObject {
+                    put("type", event.type)
+                    put("sessionId", event.sessionId)
+                    put("sourceKind", event.sourceKind ?: "")
+                    put("data", data)
+                    event.surfaceOpJson?.let { op ->
+                        runCatching { put("surfaceOp", Json.parseToJsonElement(op)) }
+                    }
+                },
+            )
+        }.toString()
+        for (record in candidates) {
+            val startedAt = System.currentTimeMillis()
+            val outcome = pluginResidentRuntime.dispatch(record.id, "storage.beforeAppend", payload, HOOK_TIMEOUT_MS)
+            val ms = System.currentTimeMillis() - startedAt
+            if (outcome == null || outcome.status != JsStatus.COMPLETED) {
+                Log.w(
+                    "DshExt",
+                    "storage before-append skipped plugin=${record.id} type=${event.type} " +
+                        "status=${outcome?.status ?: "NOT_RESIDENT"} error=${outcome?.error ?: "-"}",
+                )
+                recordExtensionDispatch(
+                    record.id, "storage.beforeAppend", ok = false,
+                    error = outcome?.error ?: outcome?.status?.name ?: "NOT_RESIDENT", ms = ms,
+                )
+                continue
+            }
+            val reply = runCatching { Json.parseToJsonElement(outcome.valueJson ?: "null").jsonObject }.getOrNull()
+            val allow = reply?.get("allow")?.jsonPrimitive?.content?.toBooleanStrictOrNull() ?: true
+            if (!allow) {
+                val reason = reply?.get("reason")?.jsonPrimitive?.contentOrNull ?: "插件拒绝写入"
+                Log.w(
+                    "DshExt",
+                    "storage before-append veto plugin=${record.id} type=${event.type} " +
+                        "source=${event.sourceKind ?: "-"} reason=$reason",
+                )
+                recordExtensionDeny(record.id, "storage.beforeAppend", reason, ms)
+                return SessionAppendDecision(
+                    allow = false,
+                    reason = "插件「${record.name}」拒绝写入 ${event.type}：$reason",
+                    pluginId = record.id,
+                )
+            }
+            recordExtensionDispatch(record.id, "storage.beforeAppend", ok = true, error = null, ms = ms)
+        }
+        return SessionAppendDecision()
+    }
+
+    /** 插件记录的 session/event veto：只问订阅了该事件 / `session/event` / `*` 的启用插件，第一个 veto 生效。 */
+    private fun dispatchPluginRecordVeto(event: PendingSessionEvent): SessionAppendDecision {
+        val candidates = pluginsUi.filter { record ->
+            record.enabled && pluginResidentRuntime.subscriptionsOf(record.id).any { name ->
+                name == "session/event" || name == event.type || name == "*"
+            }
+        }
+        if (candidates.isEmpty()) return SessionAppendDecision()
+        val data = runCatching { Json.parseToJsonElement(event.dataJson) }.getOrNull()
+            ?: return SessionAppendDecision()
+        val payload = buildJsonObject {
+            put("sessionId", event.sessionId)
+            put(
+                "event",
+                buildJsonObject {
+                    put("type", event.type)
+                    put("sessionId", event.sessionId)
+                    put("sourceKind", event.sourceKind ?: "")
+                    put("data", data)
+                },
+            )
+        }.toString()
+        for (record in candidates) {
+            val startedAt = System.currentTimeMillis()
+            val outcome = pluginResidentRuntime.dispatch(record.id, "session.veto", payload, HOOK_TIMEOUT_MS)
+            val ms = System.currentTimeMillis() - startedAt
+            if (outcome == null || outcome.status != JsStatus.COMPLETED) {
+                Log.w(
+                    "DshExt",
+                    "session veto skipped plugin=${record.id} type=${event.type} " +
+                        "status=${outcome?.status ?: "NOT_RESIDENT"} error=${outcome?.error ?: "-"}",
+                )
+                recordExtensionDispatch(
+                    record.id, "session.veto", ok = false,
+                    error = outcome?.error ?: outcome?.status?.name ?: "NOT_RESIDENT", ms = ms,
+                )
+                continue
+            }
+            val reply = runCatching { Json.parseToJsonElement(outcome.valueJson ?: "null").jsonObject }.getOrNull()
+            val veto = reply?.get("veto")?.jsonPrimitive?.content?.toBooleanStrictOrNull() ?: false
+            if (veto) {
+                val reason = reply?.get("reason")?.jsonPrimitive?.contentOrNull ?: "插件否决了这条插件记录"
+                Log.w(
+                    "DshExt",
+                    "session veto plugin=${record.id} type=${event.type} source=${event.sourceKind ?: "-"} reason=$reason",
+                )
+                recordExtensionDeny(record.id, "session.veto", reason, ms)
+                return SessionAppendDecision(
+                    allow = false,
+                    reason = "插件「${record.name}」否决了 ${event.type} 记录：$reason",
+                    pluginId = record.id,
+                )
+            }
+            recordExtensionDispatch(record.id, "session.veto", ok = true, error = null, ms = ms)
+        }
+        return SessionAppendDecision()
     }
 
     /**
@@ -6966,6 +7799,49 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
         pluginsUi = pluginStore.list()
         syncPluginTools()
     }
+
+    // ---- M88-E（docs/183 §5）：AI 全控制插件 —— 审计、开关、撤销 ----
+
+    /** 设置 →「插件」→ AI 全控制插件总开关。 */
+    override val aiPluginControlEnabled: Boolean get() = settings.aiPluginControl
+
+    override fun setAiPluginControl(enabled: Boolean) {
+        settings.setAiPluginControl(enabled)
+        pluginNotice = if (enabled) {
+            "AI 插件控制已开启：授予/撤销/配置/角色由 AI 执行，审计见插件详情"
+        } else {
+            "AI 插件控制已关闭：plugin_dev_grant / revoke / config / role 会直接拒绝"
+        }
+    }
+
+    /** 横幅「撤销」：撤销本进程最近一次 AI 授予（重启后按审计回放找最近一条）。 */
+    override fun undoAiPluginGrant() {
+        val target = lastAiGrant ?: pluginsUi.asSequence()
+            .map { plugin -> plugin.id to pluginAuditLog.aiGrantedPermissions(plugin.id) }
+            .firstOrNull { it.second.isNotEmpty() }
+        if (target == null) {
+            pluginNotice = "没有可撤销的 AI 授予"
+            return
+        }
+        val (id, permissions) = target
+        val detail = permissions.joinToString("、")
+        val result = pluginStore.revokeGrants(id, permissions.toList())
+        pluginAuditLog.append(xin.dshaa.nativeapp.data.PluginAuditLog.ACTOR_USER,
+            xin.dshaa.nativeapp.data.PluginAuditLog.ACTION_REVOKE, id, detail)
+        lastAiGrant = null
+        pluginNotice = result.message
+        pluginsUi = pluginStore.list()
+        syncPluginTools()
+        Log.i("DshPlugin", "undo AI grant plugin=$id permissions=$detail ok=${result.ok}")
+    }
+
+    /** 插件详情底部：该插件最近 5 条审计（AI 与用户操作都显示）。 */
+    override fun pluginAuditLines(pluginId: String): List<String> =
+        pluginAuditLog.recent(pluginId, 5).map { it.summary() }
+
+    /** 权限行标「AI 授予」：按审计回放当前仍由 AI 授予的权限。 */
+    override fun aiGrantedPermissions(pluginId: String): Set<String> =
+        pluginAuditLog.aiGrantedPermissions(pluginId)
 
     // ---- 技能（M19） ----
 
@@ -7447,6 +8323,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
                 log = { message -> Log.i("DshCompact", message) },
                 plan = PlanModeState(),
                 hooks = turnHooks(state),
+                toolMiddleware = { pluginToolChain },
+                // M87-B：插件请求/提示词中间件链（每次请求现取快照；空链 = 零开销）。
+                requestMiddleware = { pluginRequestChain },
             ),
         )
         val runtime = ChildRuntime(record, session, state, stop, ui, childEngine)
@@ -8110,6 +8989,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
                 )
                 append("\n\n")
                 append(approval)
+                // M88-C：让模型知道本会话能调哪些能力 id（内置 + 已启用且授权 capability 的插件能力）。
+                val capabilityIds = capabilityHost.ui().filter { it.available }.map { it.id }.take(20)
+                if (capabilityIds.isNotEmpty()) {
+                    append("\n\n")
+                    append(
+                        "可用能力（用 capability 工具按 id 调用）：${capabilityIds.joinToString("、")}。" +
+                            "插件能力需要插件已启用且拿到 capability 授权。",
+                    )
+                }
                 if (depth > 0) {
                     append("\n\n")
                     append(AgentRegistry.DELEGATION_CONTEXT)

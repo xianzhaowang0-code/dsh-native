@@ -173,8 +173,38 @@ class PluginReloadTest {
         assertEquals("""{"city":"Beijing"}""", updated.config)
     }
 
-    private fun record(
-        version: String = "0.1.0",
+    @Test
+    fun reloadCarriesRequestMiddlewareAndSlotDeclarations() {
+        // M87-B/M87-C：reload 必须把新扩展点元数据一起重算；否则改 index.js 后
+        // 「重新加载」会悄悄把请求中间件/插槽关掉（0.3.5 真机验 slot reload 时抓到）。
+        val record = record()
+        val manifest = PluginManifest(
+            id = record.id,
+            name = "Cfg",
+            version = "0.2.0",
+            description = "new",
+            main = "index.js",
+            format = PluginFormat.OPERIT,
+            permissions = listOf("llm:request", "ui:slot"),
+        )
+        val slot = SlotSpec.parse(
+            Json.parseToJsonElement(
+                """{"slot":"chat.composer.dock","id":"mirror","tree":{"type":"text","text":"x"}}""",
+            ),
+        ).slot!!
+        val run = PluginDryRun(toolMiddleware = true, llmMiddleware = true, storageHooks = true, slots = listOf(slot))
+
+        val updated = PluginReload.apply(record, manifest, run)
+
+        assertTrue(updated.llmMiddleware)
+        assertTrue(updated.storageHooks)
+        assertEquals(listOf(slot), updated.slots)
+        // 清单新申请的权限仍然要用户确认（不因为 reload 自动授权 llm:request/ui:slot）
+        assertEquals(listOf("llm:request", "ui:slot"), updated.permissions)
+        assertTrue(updated.grantedPermissions.isEmpty())
+    }
+
+    private fun record(        version: String = "0.1.0",
         enabled: Boolean = true,
         config: String = "{}",
         configSchema: String? = null,

@@ -25,6 +25,12 @@ object PluginNotifier {
     private const val CHANNEL_ID = "dsh_plugin_notify"
     private const val CHANNEL_NAME = "插件通知"
 
+    /**
+     * M87-H5：通知点击只回「聊天落地页」（用户拍板）——MainActivity 收到这个 action 时
+     * 让壳清掉页面栈（不深链到某个会话/插件页）。
+     */
+    const val ACTION_OPEN_CHAT = "xin.dshaa.action.OPEN_CHAT"
+
     fun notify(context: Context, title: String, body: String) {
         val manager = context.getSystemService(NotificationManager::class.java) ?: return
         runCatching {
@@ -42,6 +48,7 @@ object PluginNotifier {
             return
         }
         val intent = Intent(context, MainActivity::class.java).apply {
+            action = ACTION_OPEN_CHAT
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
         }
         val pending = PendingIntent.getActivity(

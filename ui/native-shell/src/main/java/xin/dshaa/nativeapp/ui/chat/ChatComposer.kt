@@ -132,6 +132,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import org.json.JSONObject
+import xin.dshaa.nativeapp.ui.shell.slots.SlotDock
 
 /**
  * 聊天输入区（2026-11-07 第二版，照 Operit `AgentChatInputSection` 的 Agent 输入条重排）。
@@ -331,6 +332,8 @@ fun ChatComposer(
             .navigationBarsPadding()
             .padding(start = 10.dp, end = 10.dp, bottom = 8.dp),
     ) {
+        // M87-C：输入条上方的插件槽位（chat.composer.dock）。
+        SlotDock("chat.composer.dock")
         if (capabilities.localQueue && (state.queuedPrompts.isNotEmpty() || state.queueNotice != null)) {
             Column(
                 Modifier.fillMaxWidth().padding(bottom = 6.dp).clip(RoundedCornerShape(12.dp))

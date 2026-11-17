@@ -23,18 +23,34 @@ class AttachmentStore(private val root: File) : AttachmentHost {
     override suspend fun saveImage(data: ByteArray, mediaType: String, name: String?): ImageRef =
         withContext(Dispatchers.IO) {
             val normalized = ImageNormalizer.normalize(data, mediaType)
-            val hex = saveNormalized(normalized.data)
-            ImageRef(
-                attachmentId = "sha256:$hex",
-                mediaType = normalized.mediaType,
-                bytes = normalized.data.size,
-                width = normalized.width,
-                height = normalized.height,
-                name = name,
-                originalWidth = normalized.originalWidth,
-                originalHeight = normalized.originalHeight,
-            )
+            refOf(normalized, name)
         }
+
+    /**
+     * M88-H（用户 2026-11-17）：文件入口，不把源文件整读进内存、不按文件大小拒绝。
+     *
+     * 归一化输出仍在 4MB 内（[ImageNormalizer.NORMALIZED_MAX_BYTES]），所以落盘/后续请求
+     * 不需要整块读一个超大源文件。
+     */
+    override suspend fun saveImageFile(file: File, mediaType: String, name: String?): ImageRef =
+        withContext(Dispatchers.IO) {
+            val normalized = ImageNormalizer.normalizeFile(file, mediaType)
+            refOf(normalized, name)
+        }
+
+    private fun refOf(normalized: ImageNormalizer.Normalized, name: String?): ImageRef {
+        val hex = saveNormalized(normalized.data)
+        return ImageRef(
+            attachmentId = "sha256:$hex",
+            mediaType = normalized.mediaType,
+            bytes = normalized.data.size,
+            width = normalized.width,
+            height = normalized.height,
+            name = name,
+            originalWidth = normalized.originalWidth,
+            originalHeight = normalized.originalHeight,
+        )
+    }
 
     /** 写一份已归一化的字节（幂等），返回 sha256 hex。 */
     fun saveNormalized(data: ByteArray): String {

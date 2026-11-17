@@ -22,6 +22,7 @@ import androidx.compose.material.icons.rounded.Api
 import androidx.compose.material.icons.rounded.Build
 import androidx.compose.material.icons.rounded.Cloud
 import androidx.compose.material.icons.rounded.DeleteSweep
+import androidx.compose.material.icons.rounded.Extension
 import androidx.compose.material.icons.rounded.FolderZip
 import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.Memory
@@ -58,7 +59,9 @@ import xin.dshaa.nativeapp.data.GitHubAuth
 import xin.dshaa.ui.shellapi.data.SettingsStore
 import xin.dshaa.ui.design.component.SettingsGroup
 import xin.dshaa.ui.design.component.SettingsNavRow
+import xin.dshaa.ui.design.component.SettingsSwitchRow
 import xin.dshaa.ui.design.theme.DshTheme2
+import xin.dshaa.nativeapp.ui.shell.slots.SlotDock
 
 /**
  * 设置首页：照 Operit `SettingsScreen` 的信息架构（分组标题 + 卡片 + 图标/标题/副标题/箭头行），
@@ -365,6 +368,8 @@ fun SettingsScreen(
                     )
                 }
             }
+            // M87-C：设置首页底部的插件行（settings.rows）。
+            SlotDock("settings.rows", horizontalPadding = 0)
             Spacer(Modifier.height(24.dp))
         }
     }

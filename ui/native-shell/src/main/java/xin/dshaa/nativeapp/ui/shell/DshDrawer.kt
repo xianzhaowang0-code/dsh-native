@@ -75,6 +75,7 @@ import xin.dshaa.ui.shellapi.BuiltinPageIds
 import xin.dshaa.ui.shellapi.data.WorkspaceUi
 import xin.dshaa.ui.design.component.DshAvatar
 import xin.dshaa.ui.design.theme.DshTheme2
+import xin.dshaa.nativeapp.ui.shell.slots.SlotDock
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -382,6 +383,9 @@ fun DshDrawer(
                     }
                 }
             }
+
+            // ---- M87-D：插件在抽屉底部追加的项（空注册表时零占位） ----
+            SlotDock("drawer.items", horizontalPadding = 0, verticalPadding = 0)
 
             // ---- 底部动作条（RikkaHub 的圆形 DrawerAction） ----
             Row(

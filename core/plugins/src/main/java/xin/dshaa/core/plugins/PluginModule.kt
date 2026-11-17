@@ -339,6 +339,10 @@ object PluginModule {
       storages: __dsh.storages,
       prompts: __dsh.prompts,
       capabilities: __dsh.capabilities,
+      slots: __dsh.slots,
+      toolMiddleware: __dshToolMiddlewareMeta(),
+      llmMiddleware: __dshExtMeta(),
+      storageHooks: __dsh.storageHooks,
       errors: __dsh.errors
     });
   });
@@ -482,6 +486,50 @@ object PluginModule {
       }
     }
     return { handled: handled, errors: errors };
+  }
+  // M87-E：插件注入记录（source.kind=plugin-*）落盘前的 veto 检查。
+  // 只调用订阅了该事件名 / 'session/event' / '*' 的 handler；显式 return null / false /
+  // {veto:true} 才 veto（普通 handler 的 undefined 视为放行），异步 handler 会被等待结算。
+  function __dshVetoEvent(payload) {
+    const event = payload.event || {};
+    const sessionId = String(payload.sessionId || '');
+    const header = payload.header || {};
+    const name = String(event.type || payload.name || '');
+    const names = [name];
+    if (name && name !== 'session/event') { names.push('session/event'); }
+    let handlers = [];
+    for (let n = 0; n < names.length; n++) {
+      handlers = handlers.concat(__dshEventHandlers[names[n]] || []);
+    }
+    if (name !== '*') { handlers = handlers.concat(__dshEventHandlers['*'] || []); }
+    let chain = Promise.resolve({ ok: true, veto: false, handled: 0 });
+    for (let i = 0; i < handlers.length; i++) {
+      chain = chain.then(function (state) {
+        if (state.veto) { return state; }
+        let produced;
+        try {
+          produced = handlers[i](event, { name: name, sessionId: sessionId, header: header });
+        } catch (err) {
+          __dsh.errors.push('session/event veto 抛错：' + String((err && err.stack) ? err.stack : err));
+          return state;
+        }
+        return Promise.resolve(produced).then(function (value) {
+          if (value === null || value === false || (value && typeof value === 'object' && value.veto === true)) {
+            return {
+              ok: true,
+              veto: true,
+              handled: state.handled + 1,
+              reason: String((value && value.reason) || '插件否决了这条插件记录')
+            };
+          }
+          return { ok: true, veto: false, handled: state.handled + 1 };
+        }, function (err) {
+          __dsh.errors.push('session/event veto 异步报错：' + String((err && err.stack) ? err.stack : err));
+          return state;
+        });
+      });
+    }
+    return chain;
   }
   // M85-A：整壳 dispatch。返回值统一是 {ok, tree} 或 {ok:false,error}；
   // mount/state/action/event 都允许返回 Promise（宿主 dispatch 会等它结算）。
@@ -720,6 +768,9 @@ object PluginModule {
         handled: emitted.handled
       };
     }
+    if (name === 'session.veto') {
+      return __dshVetoEvent(payload);
+    }
     if (name === 'projection.reset') {
       for (const key in __dshProjectionCells) { delete __dshProjectionCells[key]; }
       return { ok: true, keys: __dshProjectionKeys.slice(0) };
@@ -801,12 +852,184 @@ object PluginModule {
     if (name === 'storage.list' || name === 'storage.load') {
       return __dshStorageDispatch(name.substring(8), payload);
     }
+    if (name === 'storage.beforeAppend') {
+      const event = payload.event || {};
+      const list = __dshStorageHooks.beforeAppend;
+      const next = function(e) { return (e === undefined || e === null) ? event : e; };
+      let chain = Promise.resolve({ ok: true, allow: true, handled: 0 });
+      for (let i = 0; i < list.length; i++) {
+        chain = chain.then(function(state) {
+          if (state.allow === false) { return state; }
+          let produced;
+          try {
+            produced = list[i](event, next);
+          } catch (err) {
+            __dsh.errors.push('storage before-append 抛错：' + String((err && err.stack) ? err.stack : err));
+            return state;
+          }
+          return Promise.resolve(produced).then(function(value) {
+            if (value === false || value === null ||
+              (value && typeof value === 'object' && value.allow === false)) {
+              return {
+                ok: true,
+                allow: false,
+                handled: state.handled + 1,
+                reason: String((value && value.reason) || '插件拒绝写入')
+              };
+            }
+            return { ok: true, allow: true, handled: state.handled + 1 };
+          }, function(err) {
+            __dsh.errors.push('storage before-append 异步报错：' + String((err && err.stack) ? err.stack : err));
+            return state;
+          });
+        });
+      }
+      return chain;
+    }
+    if (name === 'storage.afterLoad') {
+      const list = __dshStorageHooks.afterLoad;
+      const errors = [];
+      let handled = 0;
+      for (let i = 0; i < list.length; i++) {
+        try {
+          const produced = list[i](payload, function() { return payload; });
+          handled++;
+          if (produced && typeof produced.then === 'function') {
+            produced.catch(function(err) {
+              __dsh.errors.push('storage after-load 异步报错：' + String((err && err.stack) ? err.stack : err));
+            });
+          }
+        } catch (err) {
+          errors.push(String((err && err.stack) ? err.stack : err));
+        }
+      }
+      return { ok: errors.length === 0, handled: handled, errors: errors };
+    }
     if (name === 'prompt.assemble') {
       return __dshPromptDispatch(payload);
     }
     // M85-F：能力提供方（capability/v1）。宿主只调一个能力 id，插件返回结果。
     if (name === 'capability.invoke') {
       return __dshCapabilityDispatch(payload);
+    }
+    // M87-B：请求/提示词中间件。宿主传入本次的只读上下文与会话 id；返回值统一 {ok, value/texts}。
+    // 抛错/拒绝由宿主按「本中间件跳过 + 记诊断」处理（dispatch 的 !ok 一律当跳过）。
+    if (name === 'ext.assemble') {
+      const prompt = String(payload.prompt === undefined || payload.prompt === null ? '' : payload.prompt);
+      return __dshExtWaterfall(__dshExtMiddleware.assemble, prompt).then(function(value) {
+        if (typeof value !== 'string') { return { ok: false, error: 'system-prompt/assemble 需要返回字符串' }; }
+        return { ok: true, value: value };
+      });
+    }
+    if (name === 'ext.request') {
+      const request = (payload.request && typeof payload.request === 'object') ? payload.request : {};
+      // 只读上下文并进请求对象（协议里没有这两个字段，宿主解码时忽略）：
+      // 插件可以按 `req.sessionId` 做模型路由，不用另开一个参数位。
+      if (typeof payload.sessionId === 'string' && payload.sessionId) { request.sessionId = payload.sessionId; }
+      if (typeof payload.provider === 'string' && payload.provider) { request.provider = payload.provider; }
+      return __dshExtWaterfall(__dshExtMiddleware.request, request).then(function(value) {
+        if (!value || typeof value !== 'object') { return { ok: false, error: 'agent/request 需要返回请求对象' }; }
+        return { ok: true, value: __dshJsonSafe(value) };
+      });
+    }
+    if (name === 'ext.stream') {
+      const delta = (payload.delta && typeof payload.delta === 'object') ? payload.delta : {};
+      return __dshExtWaterfall(__dshExtMiddleware.stream, delta).then(function(value) {
+        if (typeof value === 'string') { return { ok: true, text: value }; }
+        if (value && typeof value === 'object' && typeof value.text === 'string') { return { ok: true, text: value.text }; }
+        return { ok: false, error: 'llm/stream 需要返回字符串 / {text}' };
+      });
+    }
+    if (name === 'ext.preStep') {
+      const step = (payload.step && typeof payload.step === 'object') ? payload.step : {};
+      return __dshExtWaterfall(__dshExtMiddleware.preStep, step).then(function(value) {
+        let texts = [];
+        if (typeof value === 'string') { texts = [value]; }
+        else if (Array.isArray(value)) { texts = value.map(function(item) { return String(item); }); }
+        else if (value && typeof value === 'object' && Array.isArray(value.inject)) {
+          texts = value.inject.map(function(item) { return String(item); });
+        } else if (value && typeof value === 'object' && typeof value.text === 'string') {
+          texts = [value.text];
+        }
+        return { ok: true, texts: texts };
+      });
+    }
+    // M87-C：插槽动作。点击只回到插件 JS（不放执行命令）；handler 可返回 {state} 作为新状态。
+    if (name === 'ui.slot.action') {
+      const actionId = String(payload.action || '');
+      const handler = __dshSlotActions[actionId];
+      if (typeof handler !== 'function') {
+        return { ok: false, error: '没有注册插槽动作：' + actionId };
+      }
+      const state = (payload.state && typeof payload.state === 'object') ? payload.state : {};
+      const host = {
+        slot: String(payload.slot || ''),
+        id: String(payload.id || ''),
+        state: state,
+        payload: (payload.payload === undefined ? null : payload.payload)
+      };
+      let produced;
+      try {
+        produced = handler(host.payload, host);
+      } catch (err) {
+        return { ok: false, error: '插槽动作抛错：' + String((err && err.stack) ? err.stack : err) };
+      }
+      return Promise.resolve(produced).then(function(value) {
+        if (value && typeof value === 'object' && value.ok === false) {
+          return { ok: false, error: String(value.error || '插槽动作失败') };
+        }
+        let next = null;
+        if (value && typeof value === 'object' && value.state && typeof value.state === 'object') {
+          next = __dshJsonSafe(value.state);
+        } else if (value && typeof value === 'object') {
+          next = __dshJsonSafe(value);
+        }
+        return (next === null) ? { ok: true } : { ok: true, state: next };
+      }, function(err) {
+        return { ok: false, error: '插槽动作失败：' + String((err && err.stack) ? err.stack : err) };
+      });
+    }
+    // M87-A：工具中间件。宿主在工具回合里按 phase dispatch；闭包/顺序都留在这个 runtime。
+    if (name === 'tools.guard') {
+      const call = payload.call || {};
+      const toolName = String(call.name || '');
+      for (let i = 0; i < __dshToolMiddleware.guard.length; i++) {
+        const item = __dshToolMiddleware.guard[i];
+        if (!__dshToolMatch(item.tool, toolName)) { continue; }
+        try {
+          const verdict = item.handler(call);
+          if (verdict === false || (verdict && verdict.allow === false)) {
+            return {
+              ok: true,
+              deny: true,
+              message: String((verdict && verdict.message) ? verdict.message : '插件规则拒绝了这次工具调用')
+            };
+          }
+        } catch (err) {
+          return { ok: false, error: 'guard 抛错：' + String((err && err.message) ? err.message : err) };
+        }
+      }
+      return { ok: true, deny: false };
+    }
+    if (name === 'tools.preExecute' || name === 'tools.postExecute') {
+      const pre = name === 'tools.preExecute';
+      const list = pre ? __dshToolMiddleware.preExecute : __dshToolMiddleware.postExecute;
+      const initial = pre ? (payload.call || {}) : (payload.result || {});
+      return __dshToolPhase(list, initial, function(item, current) {
+        return item.handler(current, function(next) {
+          return (next === undefined || next === null) ? current : next;
+        });
+      }).then(function(value) {
+        return pre ? { ok: true, call: __dshJsonSafe(value) } : { ok: true, result: __dshJsonSafe(value) };
+      });
+    }
+    if (name === 'tools.result') {
+      const call = payload.call || {};
+      const result = payload.result || {};
+      for (let i = 0; i < __dshToolMiddleware.result.length; i++) {
+        try { __dshToolMiddleware.result[i].handler(call, result); } catch (err) {}
+      }
+      return { ok: true };
     }
     if (name === 'ping') {
       return {
@@ -820,6 +1043,10 @@ object PluginModule {
         storages: __dsh.storages,
         prompts: __dsh.prompts,
         capabilities: __dsh.capabilities,
+        slots: __dsh.slots,
+        toolMiddleware: __dshToolMiddlewareMeta(),
+        llmMiddleware: __dshExtMeta(),
+        storageHooks: __dsh.storageHooks,
         applied: __dsh.applied === true
       };
     }
@@ -1001,6 +1228,21 @@ object PluginModule {
             if (declarations.map { it.id }.distinct().size != declarations.size) loadingErrors += "加载页 id 重复"
             declarations.distinctBy { it.id }
         }
+        // M87-C：宿主插槽（槽位 + Surface 子树）。校验失败进 error，安装被拒（不产生半装状态）。
+        val slotErrors = ArrayList<String>()
+        val slotElements = obj["slots"] as? kotlinx.serialization.json.JsonArray
+        if (obj.containsKey("slots") && slotElements == null) slotErrors += "插槽声明必须是数组"
+        if (slotElements != null && slotElements.size > SlotSpec.MAX_DECLARATIONS) {
+            slotErrors += "插槽声明超过 ${SlotSpec.MAX_DECLARATIONS} 项"
+        }
+        val slots = slotElements.orEmpty().take(SlotSpec.MAX_DECLARATIONS).mapNotNull { element ->
+            val parsed = SlotSpec.parse(element)
+            parsed.error?.let { slotErrors += "slot/v1：$it" }
+            parsed.slot
+        }.let { declarations ->
+            if (declarations.map { it.key }.distinct().size != declarations.size) slotErrors += "插槽 slot/id 重复"
+            declarations.distinctBy { it.key }
+        }
         // M85-D：回合实现（id + label）。run 闭包留在常驻 JS 里。
         val agents = runCatching {
             val seen = HashSet<String>()
@@ -1100,7 +1342,7 @@ object PluginModule {
             imports = obj.stringList("imports"),
             relativeImports = obj.stringList("relativeImports"),
             applied = obj["applied"]?.let { runCatching { it.jsonPrimitive.content.toBooleanStrictOrNull() }.getOrNull() } ?: false,
-            error = (errors + loadingErrors).joinToString("\n").ifBlank { null },
+            error = (errors + loadingErrors + slotErrors).joinToString("\n").ifBlank { null },
             configSchema = configSchema,
             configError = configError,
             promptSections = sections("promptSections"),
@@ -1115,10 +1357,27 @@ object PluginModule {
             projections = projections,
             shells = shells,
             loadings = loadings,
+            slots = slots,
             agents = agents,
             storages = storages,
             prompts = prompts,
             capabilities = capabilities,
+            toolMiddleware = obj["toolMiddleware"]?.let {
+                runCatching { it.jsonPrimitive.content.toBooleanStrictOrNull() }.getOrNull()
+            } ?: false,
+            llmMiddleware = obj["llmMiddleware"]?.let {
+                runCatching { it.jsonPrimitive.content.toBooleanStrictOrNull() }.getOrNull()
+            } ?: false,
+            storageHooks = obj["storageHooks"]?.let { element ->
+                val hooks = element as? kotlinx.serialization.json.JsonObject
+                val before = hooks?.get("beforeAppend")?.let {
+                    runCatching { it.jsonPrimitive.content.toIntOrNull() }.getOrNull()
+                } ?: 0
+                val after = hooks?.get("afterLoad")?.let {
+                    runCatching { it.jsonPrimitive.content.toIntOrNull() }.getOrNull()
+                } ?: 0
+                before > 0 || after > 0
+            } ?: false,
             unsupported = obj.stringList("unsupported"),
             provides = provides,
             injects = injectDeps,
@@ -1235,7 +1494,7 @@ object PluginModule {
      * 「跑不跑得起来、注册了什么」，不因为这些服务没实现就误报失败。
      */
     private val PRELUDE = """
-  const __dsh = { name: null, version: null, inject: [], tools: [], errors: [], imports: [], relativeImports: [], applied: false, configSchema: null, configError: null, promptSections: [], contexts: [], promptVariables: {}, suppressRuntimeContext: false, commands: [], llmProviders: [], routes: [], projections: [], shells: [], loadings: [], agents: [], storages: [], prompts: [], capabilities: [], unsupported: [], provides: {}, injects: [], missingDeps: [], effects: [], subscriptions: [] };
+  const __dsh = { name: null, version: null, inject: [], tools: [], errors: [], imports: [], relativeImports: [], applied: false, configSchema: null, configError: null, promptSections: [], contexts: [], promptVariables: {}, suppressRuntimeContext: false, commands: [], llmProviders: [], routes: [], projections: [], shells: [], loadings: [], slots: [], agents: [], storages: [], prompts: [], capabilities: [], toolMiddleware: false, llmMiddleware: false, storageHooks: { beforeAppend: 0, afterLoad: 0 }, unsupported: [], provides: {}, injects: [], missingDeps: [], effects: [], subscriptions: [] };
   function __dshUnsupported(name) {
     if (__dsh.unsupported.indexOf(name) < 0) { __dsh.unsupported.push(name); }
     return __noop;
@@ -1248,6 +1507,9 @@ object PluginModule {
   // M84-I：事件订阅 / 清理器。只有常驻运行时能把宿主事件送进来、并在停用时跑 cleanup。
   const __dshEventHandlers = {};
   const __dshCleanups = [];
+  // M87-C：声明式宿主插槽。注册是静态 JSON（dry-run 收集进 __dsh.slots，安装时由宿主校验）；
+  // 动作闭包留在常驻 runtime，宿主点击后 dispatch 'ui.slot.action' 回来。
+  const __dshSlotActions = {};
   // M84-J：带 stream 回调的模型供应商。宿主发起请求时 dispatch 'llm.stream' 进常驻运行时。
   const __dshStreamProviders = {};
   // M85-A：整壳。mount/onState/onAction 闭包留在常驻 runtime，宿主每次 dispatch 进来取新树。
@@ -1258,10 +1520,111 @@ object PluginModule {
   const __dshAgentIds = [];
   // M85-E：存储（storage/v1，只读）与提示词（prompt/v1）。list/load/assemble 闭包留在常驻 runtime。
   const __dshStorageDefs = {};
+  // M87-E：会话写入钩子（storage:hooks）。before-append 在落盘前询问，after-load 在打开会话并重放后通知。
+  const __dshStorageHooks = { beforeAppend: [], afterLoad: [] };
   const __dshPromptDefs = {};
   // M85-F：能力提供方（capability/v1）。invoke 闭包留在常驻 runtime；宿主的插件页/调试通道
   // dispatch 'capability.invoke' 进来。root/NFC/Shizuku/adb-shell 等特权能力只能这样由插件提供。
   const __dshCapabilityDefs = {};
+  // M87-A：工具中间件（restrict/guard/describe/on）。闭包留在常驻 runtime；宿主按 phase
+  // dispatch 'tools.guard' / 'tools.preExecute' / 'tools.postExecute' / 'tools.result' 进来。
+  // restrict 的匹配模式与 describe 的静态 patch 通过启动 meta 交给宿主（同步快速路径，不再往返 JS）。
+  const __dshToolMiddleware = { restrict: [], guard: [], describe: [], preExecute: [], postExecute: [], result: [] };
+  function __dshToolMiddlewareActive() {
+    const m = __dshToolMiddleware;
+    return (m.restrict.length + m.guard.length + m.describe.length +
+      m.preExecute.length + m.postExecute.length + m.result.length) > 0;
+  }
+  function __dshToolMiddlewareMeta() {
+    const restrict = [];
+    for (let i = 0; i < __dshToolMiddleware.restrict.length; i++) {
+      const patterns = __dshToolMiddleware.restrict[i].patterns;
+      for (let j = 0; j < patterns.length; j++) { restrict.push(patterns[j]); }
+    }
+    const guards = [];
+    for (let i = 0; i < __dshToolMiddleware.guard.length; i++) { guards.push(__dshToolMiddleware.guard[i].tool); }
+    const describes = [];
+    for (let i = 0; i < __dshToolMiddleware.describe.length; i++) {
+      const item = __dshToolMiddleware.describe[i];
+      describes.push({ tool: item.tool, patch: item.patch });
+    }
+    return {
+      active: __dshToolMiddlewareActive(),
+      restrict: restrict,
+      guard: guards,
+      describe: describes,
+      preExecute: __dshToolMiddleware.preExecute.length,
+      postExecute: __dshToolMiddleware.postExecute.length,
+      result: __dshToolMiddleware.result.length
+    };
+  }
+  // 只支持 `*` 通配（如 shower_*）：按段匹配，不引正则，避免和 Kotlin 模板字符串打架。
+  function __dshToolMatch(pattern, name) {
+    const text = String(pattern === undefined || pattern === null ? '' : pattern);
+    if (text === '*' || text === name) { return true; }
+    const parts = text.split('*');
+    if (parts.length === 1) { return false; }
+    let index = 0;
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      if (!part) { continue; }
+      const found = name.indexOf(part, index);
+      if (found < 0) { return false; }
+      if (i === 0 && found !== 0) { return false; }
+      index = found + part.length;
+    }
+    const last = parts[parts.length - 1];
+    return !last || index === name.length;
+  }
+  function __dshToolPhase(list, initial, run) {
+    let pending = Promise.resolve(initial);
+    for (let i = 0; i < list.length; i++) {
+      (function(item) {
+        pending = pending.then(function(current) { return Promise.resolve(run(item, current)); });
+      })(list[i]);
+    }
+    return pending;
+  }
+  // M87-B（docs/181 §3.3）：请求/提示词中间件。四个扩展点用 ctx.on 注册，闭包留在常驻 runtime；
+  // 宿主按点 dispatch 'ext.assemble' / 'ext.request' / 'ext.stream' / 'ext.preStep' 进来。
+  // 与工具中间件不同，这些不能做成同步元数据：必须看到本次 system/请求/增量才能决定怎么改。
+  const __dshExtMiddleware = { request: [], assemble: [], stream: [], preStep: [] };  function __dshExtActive() {
+    const m = __dshExtMiddleware;
+    return (m.request.length + m.assemble.length + m.stream.length + m.preStep.length) > 0;
+  }
+  function __dshExtMeta() {
+    return {
+      active: __dshExtActive(),
+      request: __dshExtMiddleware.request.length,
+      assemble: __dshExtMiddleware.assemble.length,
+      stream: __dshExtMiddleware.stream.length,
+      preStep: __dshExtMiddleware.preStep.length
+    };
+  }
+  // 瀑布语义：handler(payload, next) 可先改 payload 再 await next(改后的值)；
+  // 返回 null/undefined = 放弃改写、自动继续链；返回其它值 = 终止链并采用该值。
+  function __dshExtWaterfall(list, initial) {
+    function invoke(index, value) {
+      if (index >= list.length) { return Promise.resolve(value); }
+      var continued = false;
+      function next(v) {
+        continued = true;
+        return invoke(index + 1, (v === undefined) ? value : v);
+      }
+      var produced;
+      try {
+        produced = list[index].handler(value, next);
+      } catch (err) {
+        return Promise.reject(err);
+      }
+      return Promise.resolve(produced).then(function(result) {
+        if (continued) { return result; }
+        if (result === undefined || result === null) { return invoke(index + 1, value); }
+        return result;
+      });
+    }
+    return invoke(0, initial);
+  }
   function __dshJsonSafe(value) {
     if (value === undefined) { return null; }
     try { return JSON.parse(JSON.stringify(value)); } catch (e) { return String(value); }
@@ -1851,7 +2214,52 @@ object PluginModule {
       register: __toolsRegister,
       get: function() { return undefined; },
       list: function() { return []; },
-      names: function() { return __dsh.tools.map(function(t) { return t.name; }); }
+      names: function() { return __dsh.tools.map(function(t) { return t.name; }); },
+      // M87-A（docs/181 §3.2）：工具中间件。
+      // restrict/guard 只收紧权限（导入即允许）；describe/on 需要 tools:intercept 授权，由宿主判定。
+      restrict: function(names) {
+        const list = Array.isArray(names) ? names : [names];
+        const patterns = [];
+        for (let i = 0; i < list.length; i++) {
+          const value = String(list[i] === undefined || list[i] === null ? '' : list[i]);
+          if (value) { patterns.push(value); }
+        }
+        if (patterns.length > 0) {
+          __dshToolMiddleware.restrict.push({ patterns: patterns });
+          __dsh.toolMiddleware = true;
+        }
+        return __noop;
+      },
+      guard: function(tool, handler) {
+        if (typeof handler !== 'function') { return __noop; }
+        __dshToolMiddleware.guard.push({
+          tool: String(tool === undefined || tool === null ? '*' : tool),
+          handler: handler
+        });
+        __dsh.toolMiddleware = true;
+        return __noop;
+      },
+      describe: function(tool, patch) {
+        if (!patch || typeof patch !== 'object') { return __noop; }
+        __dshToolMiddleware.describe.push({
+          tool: String(tool === undefined || tool === null ? '*' : tool),
+          patch: __dshJsonSafe(patch)
+        });
+        __dsh.toolMiddleware = true;
+        return __noop;
+      },
+      on: function(phase, handler) {
+        if (typeof handler !== 'function') { return __noop; }
+        const name = String(phase === undefined || phase === null ? '' : phase);
+        const slot = (name === 'pre-execute') ? 'preExecute'
+          : (name === 'post-execute') ? 'postExecute'
+          : (name === 'result') ? 'result'
+          : null;
+        if (!slot) { return __noop; }
+        __dshToolMiddleware[slot].push({ handler: handler });
+        __dsh.toolMiddleware = true;
+        return __noop;
+      }
     }),
     // P4（M57）：提示词段 / 动态上下文。text 允许是函数：注册时用当前 ctx 求值一次
     //（手机端没有「每轮请求再进 JS 求值」的常驻运行时，函数型按静态快照处理）。
@@ -1964,6 +2372,26 @@ object PluginModule {
       },
       exportLoad: function(sessionId) {
         return __dshHostJson('storage.exportLoad', { sessionId: String(sessionId || '') });
+      },
+      // M87-E：会话写入钩子（storage:hooks）。before-append 在落盘前询问，after-load 在打开会话并重放后通知。
+      // 这里只收集闭包；宿主按 storage:hooks 授权决定是否 dispatch。
+      on: function(event, handler) {
+        const name = String(event || '').trim();
+        if (name !== 'before-append' && name !== 'after-load') {
+          return __dshUnsupported('storage.on(' + name + ')');
+        }
+        if (typeof handler !== 'function') {
+          __dsh.errors.push('storage.on 需要 handler 函数：' + name);
+          return __noop;
+        }
+        if (name === 'before-append') {
+          __dshStorageHooks.beforeAppend.push(handler);
+          __dsh.storageHooks.beforeAppend = __dshStorageHooks.beforeAppend.length;
+        } else {
+          __dshStorageHooks.afterLoad.push(handler);
+          __dsh.storageHooks.afterLoad = __dshStorageHooks.afterLoad.length;
+        }
+        return __noop;
       }
     }),
     // M85-F：能力提供方（capability/v1）。插件声明一个能力 id + invoke(args)；
@@ -2174,6 +2602,60 @@ object PluginModule {
         return __noop;
       },
       registerView: function() { return __dshUnsupported('ui.registerView'); },
+      // M87-C（docs/181 §3.4）：声明式宿主插槽。树必须是静态 JSON（不许函数/undefined），
+      // 第一版槽位由宿主 SlotSpec 校验；这里只做形状检查与收集。
+      slots: __permissive({
+        register: function(def) {
+          if (!def || typeof def !== 'object') {
+            __dsh.errors.push('slot/v1：register 需要 {slot,id,tree}');
+            return __noop;
+          }
+          const slot = String(def.slot || '').trim();
+          const id = String(def.id || '').trim();
+          if (!slot || !id || !def.tree || typeof def.tree !== 'object') {
+            __dsh.errors.push('slot/v1：register 需要 {slot,id,tree}');
+            return __noop;
+          }
+          if (__dsh.slots.length >= 16) {
+            __dsh.errors.push('slot/v1：最多注册 16 个插槽');
+            return __noop;
+          }
+          if (__dsh.slots.some(function(item) { return item.slot === slot && item.id === id; })) {
+            __dsh.errors.push('slot/v1：重复 slot/id ' + slot + '/' + id);
+            return __noop;
+          }
+          try {
+            const raw = JSON.stringify({
+              slot: slot,
+              id: id,
+              order: (typeof def.order === 'number') ? def.order : 100,
+              when: (def.when && typeof def.when === 'object') ? def.when : { session: 'any' },
+              tree: def.tree
+            }, function(key, value) {
+              if (typeof value === 'function' || typeof value === 'undefined' || typeof value === 'symbol') {
+                throw new Error('插槽树只接受静态 JSON');
+              }
+              return value;
+            });
+            if (raw.length > 16384) { throw new Error('插槽声明过大'); }
+            __dsh.slots.push(JSON.parse(raw));
+          } catch (err) {
+            __dsh.errors.push('slot/v1：' + String((err && err.message) || err));
+          }
+          return __noop;
+        },
+        // 动作闭包：宿主点击后 dispatch 'ui.slot.action'；handler(payload, host) 可返回
+        // {state: {...}} 作为新的槽位状态（宿主只读渲染，不执行任意命令）。
+        action: function(id, handler) {
+          const key = String(id || '').trim();
+          if (!key || typeof handler !== 'function') {
+            __dsh.errors.push('slot/v1：action 需要 (id, handler)');
+            return __noop;
+          }
+          __dshSlotActions[key] = handler;
+          return __noop;
+        }
+      }),
       // M85-A：整壳。一个插件可以带多个壳；宿主按 `dsh_shell` 选择并 dispatch
       // shell.mount / shell.state / shell.action / shell.event。定义留在常驻 runtime，
       // 元数据（id/label/有哪些回调）进 __dsh.shells 供宿主/插件页展示。
@@ -2321,6 +2803,20 @@ object PluginModule {
     },
     on: function(event, handler) {
       if (typeof event !== 'string' || !event) { return __noop; }
+      // M87-B：四个请求/提示词扩展点走中间件链，不是会话事件订阅：
+      // 不进 subscriptions（宿主不会把它们当会话事件投递），启动时由 llmMiddleware 元数据告诉宿主。
+      const extSlot = (event === 'agent/request') ? 'request'
+        : (event === 'llm/stream') ? 'stream'
+        : (event === 'system-prompt/assemble') ? 'assemble'
+        : (event === 'agent/pre-step') ? 'preStep'
+        : null;
+      if (extSlot) {
+        if (typeof handler === 'function' && __dshExtMiddleware[extSlot].length < 32) {
+          __dshExtMiddleware[extSlot].push({ handler: handler });
+        }
+        if (typeof handler === 'function') { __dsh.llmMiddleware = true; }
+        return __noop;
+      }
       if (__dsh.subscriptions.indexOf(event) < 0) { __dsh.subscriptions.push(event); }
       // M84-I：handler 留在常驻运行时里；宿主事件（turn/start、tool/result…）dispatch 进来时调用。
       if (typeof handler === 'function') {

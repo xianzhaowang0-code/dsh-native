@@ -34,6 +34,7 @@ import xin.dshaa.core.model.MessageRole
 import xin.dshaa.core.model.markOffloadedImages
 import xin.dshaa.core.model.toContentBlock
 import xin.dshaa.core.model.toImageRef
+import xin.dshaa.core.protocol.ApiMessage
 import xin.dshaa.core.protocol.ApiRequest
 import xin.dshaa.core.protocol.ApiTool
 import xin.dshaa.core.protocol.TokenUsage
@@ -41,8 +42,13 @@ import xin.dshaa.core.protocol.ContentBlock as ApiBlock
 import xin.dshaa.core.session.GoalActivationState
 import xin.dshaa.core.session.GoalStore
 import xin.dshaa.core.session.SessionCodec
+import xin.dshaa.core.session.SessionAppendDecision
+import xin.dshaa.core.session.SessionAppendGate
+import xin.dshaa.core.session.SessionAppendVetoed
 import xin.dshaa.core.session.SessionRepository
 import xin.dshaa.core.session.SessionSession
+import xin.dshaa.core.session.SessionWriteHooks
+import xin.dshaa.core.session.PendingSessionEvent
 import xin.dshaa.core.tools.DshTool
 import xin.dshaa.core.tools.GoalNotice
 import xin.dshaa.core.tools.ToolContext
@@ -54,6 +60,7 @@ import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -81,6 +88,7 @@ class TurnEngineTest {
     private var streamOverride: ((ApiRequest) -> Flow<LlmEvent>)? = null
     private var idSeq = 0
     private val logs = mutableListOf<String>()
+    private val llmEvents = mutableListOf<LlmEvent>()
 
     @BeforeTest
     fun setUp() {
@@ -128,6 +136,68 @@ class TurnEngineTest {
         assertEquals(listOf(MessageRole.USER, MessageRole.ASSISTANT), ui.messages.map { it.role })
         assertEquals("hello", ui.messages[1].content.first().text)
         assertNull(ui.lastError)
+    }
+
+    @Test
+    fun vetoedFirstUserMessageStillClosesTurnAsError() = runBlocking {
+        // M87-E：首条 user/message 在 turn/start + step/start 之后落库；被 before-append 拒绝时
+        // 必须补 step/end + turn/end(error)，不能只写一半（否则会话留下悬空回合）。
+        SessionWriteHooks.gate = object : SessionAppendGate {
+            override fun beforeAppend(event: PendingSessionEvent): SessionAppendDecision =
+                if (event.type == "user/message") {
+                    SessionAppendDecision(allow = false, reason = "M87E 用户消息拒绝", pluginId = "m87e-test")
+                } else {
+                    SessionAppendDecision()
+                }
+        }
+        try {
+            assertFailsWith<SessionAppendVetoed> { engine().startTurn(ui, TurnInput("M87E-VETO")) }
+
+            val session = assertNotNull(repo.load(gateway.session!!.header.id))
+            assertEquals(
+                listOf("request/header", "turn/start", "step/start", "step/end", "turn/end"),
+                session.events.map { it.type },
+                "首条用户消息被拒：不落 user/message，但回合要收口",
+            )
+            assertEquals("error", turnEndKind(session))
+            assertEquals(0, requests.size, "被拒的回合不应该发请求")
+            assertTrue(assertNotNull(ui.lastError).contains("拒绝写入"), "UI 要显示拒绝原因")
+        } finally {
+            SessionWriteHooks.resetForTest()
+        }
+    }
+
+    @Test
+    fun vetoedToolResultIsReplacedByTrustedHostFallback() = runBlocking {
+        // M87-E：原始工具结果不落盘；宿主补一条 trusted 错误结果保持 tool_use/tool_result 配对，
+        // 回合继续跑到模型收尾（UI 也显示 fallback 文案）。
+        SessionWriteHooks.gate = object : SessionAppendGate {
+            override fun beforeAppend(event: PendingSessionEvent): SessionAppendDecision =
+                if (event.type == "tool/result") {
+                    SessionAppendDecision(allow = false, reason = "M87E 工具结果拒绝", pluginId = "m87e-test")
+                } else {
+                    SessionAppendDecision()
+                }
+        }
+        try {
+            responses += toolCallResponse("call-1", "fake_tool", "{}")
+            responses += textResponse("done")
+            engine().startTurn(ui, TurnInput("hi"))
+
+            val session = assertNotNull(repo.load(gateway.session!!.header.id))
+            assertEquals(1, session.events.count { it.type == "tool/result" })
+            assertFalse(session.events.toString().contains("TOOL_OUTPUT"), "原始输出不能落盘")
+            val result = SessionCodec.messagesOf(session.events).last { it.role == MessageRole.TOOL }
+            assertTrue(result.content.first().text.contains("原始输出未落盘"), "宿主补写失败文案：${result.content}")
+            assertTrue(result.isError)
+            assertTrue(requests[1].allText().contains("原始输出未落盘"), "模型看到的是宿主 fallback")
+            assertEquals("done", ui.messages.last().content.first().text)
+            assertEquals("completed", turnEndKind(session), "工具结果被拒不应打断回合")
+            assertNull(ui.lastError)
+            assertTrue(logs.any { it.contains("tool-result-veto: call=call-1") })
+        } finally {
+            SessionWriteHooks.resetForTest()
+        }
     }
 
     @Test
@@ -188,6 +258,71 @@ class TurnEngineTest {
         assertEquals("User denied this tool call.", result.content.first().text)
         assertTrue(result.isError)
         assertEquals(2, requests.size)
+    }
+
+    @Test
+    fun halfJsonArgumentsFailExplicitlyAndNextCallStillRuns() = runBlocking {
+        // M88-G：以前 parseArgs 对半截 JSON 静默返回 {}，工具拿空参数执行 → 用户看到「没反应」。
+        // 现在落显式 error tool_result，回合继续；模型下一个调用照常执行。
+        var runs = 0
+        toolResult = { runs++; ToolResult.ok("TOOL_OUTPUT") }
+        responses += toolCallResponse("call-1", "fake_tool", "{\"q\":\"半截")
+        responses += toolCallResponse("call-2", "fake_tool", "{\"q\":2}")
+        responses += textResponse("done")
+
+        val outcome = engine().startTurn(ui, TurnInput("hi"))
+
+        assertEquals(TurnOutcome.COMPLETED, outcome, "参数错误不能打断回合")
+        assertEquals(1, runs, "半截 JSON 的工具一次都不能执行")
+        assertEquals(3, requests.size)
+        val session = assertNotNull(repo.load(gateway.session!!.header.id))
+        val results = SessionCodec.messagesOf(session.events).filter { it.role == MessageRole.TOOL }
+        assertEquals(2, results.size)
+        assertTrue(results[0].isError)
+        assertTrue(results[0].content.first().text.contains("不是合法 JSON"), results[0].content.toString())
+        assertEquals("TOOL_OUTPUT", results[1].content.first().text)
+        assertEquals("completed", turnEndKind(session))
+        assertTrue(logs.any { it.contains("tool-input: call=call-1") })
+        assertNull(ui.lastError)
+    }
+
+    @Test
+    fun oversizedArgumentsFailWithByteLimitAndTurnContinues() = runBlocking {
+        var runs = 0
+        toolResult = { runs++; ToolResult.ok("TOOL_OUTPUT") }
+        val oversized = "{\"q\":\"" + "a".repeat(64 * 1024) + "\"}"
+        responses += toolCallResponse("call-1", "fake_tool", oversized)
+        responses += toolCallResponse("call-2", "fake_tool", "{\"q\":2}")
+        responses += textResponse("done")
+
+        engine().startTurn(ui, TurnInput("hi"))
+
+        assertEquals(1, runs)
+        val session = assertNotNull(repo.load(gateway.session!!.header.id))
+        val first = SessionCodec.messagesOf(session.events).first { it.role == MessageRole.TOOL }
+        assertTrue(first.isError)
+        assertTrue(first.content.first().text.contains("工具输入过长"), first.content.toString())
+        assertTrue(first.content.first().text.contains("字节 > 上限 65536 字节"), first.content.toString())
+        assertEquals("completed", turnEndKind(session))
+    }
+
+    @Test
+    fun argumentsExactlyAtTheLimitStillExecute() = runBlocking {
+        var runs = 0
+        toolResult = { runs++; ToolResult.ok("TOOL_OUTPUT") }
+        // 前缀 `{"q":"` 6 字节 + 后缀 `"}` 2 字节，正文补到 64KB 整。
+        val exact = "{\"q\":\"" + "a".repeat(64 * 1024 - 8) + "\"}"
+        assertEquals(64 * 1024, ToolInputGuard.byteSize(exact))
+        responses += toolCallResponse("call-1", "fake_tool", exact)
+        responses += textResponse("done")
+
+        engine().startTurn(ui, TurnInput("hi"))
+
+        assertEquals(1, runs, "恰好等于上限必须放行")
+        val session = assertNotNull(repo.load(gateway.session!!.header.id))
+        val result = SessionCodec.messagesOf(session.events).first { it.role == MessageRole.TOOL }
+        assertFalse(result.isError)
+        assertEquals("TOOL_OUTPUT", result.content.first().text)
     }
 
     @Test
@@ -1642,8 +1777,12 @@ class TurnEngineTest {
         var queueClaimed = false
         var polls = 0
         responses += listOf(LlmEvent.TextDelta(0, "truncated"), LlmEvent.MessageDelta("max_tokens", 5))
-        engine(claimSteeringInputs = { polls++; emptyList() },
+        val outcome = engine(claimSteeringInputs = { polls++; emptyList() },
             nextQueuedInput = { queueClaimed = true; null }).startTurn(ui, TurnInput("initial"))
+        // H1：纯文本截断也要能被宿主识别成「可续写」，turn/end 仍是 error。
+        assertEquals(TurnOutcome.MAX_TOKENS, outcome)
+        assertEquals("error", turnEndKind(gateway.session!!))
+        assertTrue(ui.lastError.orEmpty().contains("继续生成"), "截断文案要可行动：${ui.lastError}")
         assertTrue(!queueClaimed)
         assertEquals(1, polls, "Only the initial pre-request boundary may poll; max_tokens must not claim late inputs")
     }
@@ -1664,7 +1803,7 @@ class TurnEngineTest {
             nextQueuedInput = { queueClaimed = true; null },
         ).startTurn(ui, TurnInput("initial"))
 
-        assertEquals(TurnOutcome.ERROR, outcome)
+        assertEquals(TurnOutcome.MAX_TOKENS, outcome)
         assertEquals(0, executed, "截断的工具批次一次都不能执行")
         assertTrue(!queueClaimed, "max_tokens 后不能领队列")
         assertEquals(1, polls, "截断的 step 结束后不能再 poll steer")
@@ -1704,7 +1843,7 @@ class TurnEngineTest {
         responses += truncatedToolCallResponse("call-cut" to ("fake_tool" to "{}"))
         val outcome = engine().startTurn(ui, TurnInput("initial"))
 
-        assertEquals(TurnOutcome.ERROR, outcome)
+        assertEquals(TurnOutcome.MAX_TOKENS, outcome)
         assertEquals(1, executed, "第一批发出的工具正常执行，截断的那一批不执行")
         val session = assertNotNull(repo.load(gateway.session!!.header.id))
         val calls = session.events.filter { it.type == "tool/call" }
@@ -1730,6 +1869,248 @@ class TurnEngineTest {
         assertTrue(requests.isEmpty())
     }
 
+    // ---------------- M87-A：工具中间件插点 ----------------
+
+    @Test
+    fun guardDeniesBeforeApprovalAndNeverExecutes() = runBlocking {
+        var approvalCalls = 0
+        var executed = 0
+        toolResult = { executed++; ToolResult.ok("must not run") }
+        responses += toolCallResponse("call-guard", "fake_tool", "{}")
+        responses += textResponse("done")
+        val chain = ToolMiddlewareChain(
+            listOf(object : ToolMiddleware {
+                override val id: String = "p/guard"
+                override suspend fun guard(call: ToolCallView): String? = "blocked by policy"
+            }),
+        )
+        val outcome = engine(
+            approval = { approvalCalls++; true },
+            toolMiddleware = { chain },
+        ).startTurn(ui, TurnInput("go"))
+
+        assertEquals(TurnOutcome.COMPLETED, outcome)
+        assertEquals(0, approvalCalls, "guard 必须在审批之前拒绝")
+        assertEquals(0, executed, "被 guard 拒绝的工具一次都不能执行")
+        val tool = ui.messages.last { it.role == MessageRole.TOOL }
+        assertTrue(tool.content.first().text.contains("blocked by policy"), "拒绝原因要落成 tool_result")
+        assertTrue(requests.last().allText().contains("blocked by policy"))
+    }
+
+    @Test
+    fun restrictRemovesToolFromRequestAndDescribeRewritesIt() = runBlocking {
+        responses += textResponse("done")
+        val chain = ToolMiddlewareChain(
+            listOf(object : ToolMiddleware {
+                override val id: String = "p/restrict"
+                override fun allowTool(name: String): Boolean = name != "fake_tool"
+            }),
+        )
+        engine(toolMiddleware = { chain }).startTurn(ui, TurnInput("go"))
+        assertTrue(requests.first().tools.orEmpty().none { it.name == "fake_tool" }, "被 restrict 的工具不能进 tools[]")
+
+        responses += textResponse("done")
+        val describe = ToolMiddlewareChain(
+            listOf(object : ToolMiddleware {
+                override val id: String = "p/describe"
+                override fun describe(tool: ApiTool): ApiTool =
+                    tool.copy(description = "rewritten:${tool.description}")
+            }),
+        )
+        engine(toolMiddleware = { describe }).startTurn(ui, TurnInput("again"))
+        assertEquals("rewritten:fake", requests.last().tools.orEmpty().single { it.name == "fake_tool" }.description)
+    }
+
+    @Test
+    fun restrictedToolCallIsRejectedWithoutExecuting() = runBlocking {
+        var executed = 0
+        toolResult = { executed++; ToolResult.ok("must not run") }
+        // 模型「幻觉」出一个已被 restrict 的工具名：清单里看不到，但执行前必须再拦一次。
+        responses += toolCallResponse("call-restricted", "fake_tool", "{}")
+        responses += textResponse("done")
+        val chain = ToolMiddlewareChain(
+            listOf(object : ToolMiddleware {
+                override val id: String = "p/restrict"
+                override fun allowTool(name: String): Boolean = name != "fake_tool"
+            }),
+        )
+        val outcome = engine(toolMiddleware = { chain }).startTurn(ui, TurnInput("go"))
+
+        assertEquals(TurnOutcome.COMPLETED, outcome)
+        assertEquals(0, executed, "被 restrict 的工具即使模型直接点名也不能执行")
+        val tool = ui.messages.last { it.role == MessageRole.TOOL }
+        assertTrue(tool.content.first().text.contains("restrict"), "拒绝原因要落成 tool_result")
+        assertTrue(requests.last().allText().contains("restrict"))
+    }
+
+    @Test
+    fun postExecuteRewriteReachesModelAndToolCardMarker() = runBlocking {
+        toolResult = { ToolResult.ok("original result") }
+        responses += toolCallResponse("call-post", "fake_tool", "{}")
+        responses += textResponse("done")
+        val chain = ToolMiddlewareChain(
+            listOf(object : ToolMiddleware {
+                override val id: String = "p/post"
+                override suspend fun postExecute(call: ToolCallView, result: ToolResult): ToolResult =
+                    result.copy(text = "rewritten result")
+            }),
+        )
+        engine(toolMiddleware = { chain }).startTurn(ui, TurnInput("go"))
+
+        assertTrue(requests.last().allText().contains("rewritten result"), "模型看到改写后的值")
+        val tool = ui.messages.last { it.role == MessageRole.TOOL }
+        assertEquals("rewritten result", tool.content.first().text)
+        val marker = tool.sourceSummary.orEmpty()
+        assertTrue(marker.contains("p/post"), "工具卡要标改写者：$marker")
+        assertTrue(marker.contains("原始"), "工具卡要带原始哈希：$marker")
+    }
+
+    // ---------------- M87-B：请求/提示词中间件插点 ----------------
+
+    @Test
+    fun emptyRequestMiddlewareChainKeepsRequestByteIdentical() = runBlocking {
+        // 零插件：不传链（默认 EMPTY）与显式 EMPTY 两次**新会话**请求必须完全相等。
+        responses += textResponse("one")
+        engine().startTurn(ui, TurnInput("hi"))
+        val first = requests.single()
+        gateway.session = null
+        responses += textResponse("two")
+        engine(requestMiddleware = { RequestMiddlewareChain.EMPTY }).startTurn(TestUi(), TurnInput("hi"))
+        assertEquals(2, requests.size)
+        assertEquals(first, requests[1], "空链请求体必须逐字段相同")
+    }
+
+    @Test
+    fun systemPromptAssembleRewritesOnlyThisRequest() = runBlocking {
+        responses += textResponse("ok")
+        val chain = RequestMiddlewareChain(
+            listOf(object : RequestMiddleware {
+                override val id: String = "p/assemble"
+                override suspend fun assembleSystemPrompt(prompt: String, context: RequestContext): String? =
+                    "$prompt\n[PLUGIN-SECTION]"
+            }),
+        )
+        engine(requestMiddleware = { chain }).startTurn(ui, TurnInput("hi"))
+
+        assertEquals("SYS\n[PLUGIN-SECTION]", requests.single().system, "assemble 结果要进本次 system")
+        val session = assertNotNull(repo.load(gateway.session!!.header.id))
+        assertFalse(
+            session.events.toString().contains("PLUGIN-SECTION"),
+            "system 只改本次请求，不能落进会话历史",
+        )
+    }
+
+    @Test
+    fun agentRequestRewriteDoesNotTouchHistoryOrUi() = runBlocking {
+        responses += textResponse("ok")
+        var seenContext: RequestContext? = null
+        val chain = RequestMiddlewareChain(
+            listOf(object : RequestMiddleware {
+                override val id: String = "p/route"
+                override suspend fun rewriteRequest(request: ApiRequest, context: RequestContext): ApiRequest? {
+                    seenContext = context
+                    return request.copy(
+                        model = "deepseek-router",
+                        messages = request.messages + ApiMessage(
+                            "user",
+                            listOf(ApiBlock.Text("INJECTED-ONLY-IN-REQUEST")),
+                        ),
+                    )
+                }
+            }),
+        )
+        engine(requestMiddleware = { chain }).startTurn(ui, TurnInput("hi"))
+
+        val sent = requests.single()
+        assertEquals("deepseek-router", sent.model, "模型路由要进本次请求")
+        assertTrue(sent.allText().contains("INJECTED-ONLY-IN-REQUEST"))
+        assertEquals(gateway.session!!.header.id, seenContext?.sessionId, "插件要能按 session 路由")
+        assertFalse(
+            ui.messages.any { message -> message.content.any { it.text.contains("INJECTED-ONLY-IN-REQUEST") } },
+            "请求副本不能改 UI 消息",
+        )
+        val session = assertNotNull(repo.load(gateway.session!!.header.id))
+        assertFalse(
+            session.events.toString().contains("INJECTED-ONLY-IN-REQUEST"),
+            "请求副本不能落会话历史",
+        )
+    }
+
+    @Test
+    fun streamRewriteReachesUiLogAndPersistence() = runBlocking {
+        llmEvents.clear()
+        responses += textResponse("hello foo world")
+        val chain = RequestMiddlewareChain(
+            listOf(object : RequestMiddleware {
+                override val id: String = "p/stream"
+                override suspend fun transformStreamDelta(delta: StreamDelta, context: RequestContext): StreamDelta? =
+                    delta.copy(text = delta.text.replace("foo", "bar"))
+            }),
+        )
+        engine(requestMiddleware = { chain }).startTurn(ui, TurnInput("hi"))
+
+        val assistant = ui.messages.last { it.role == MessageRole.ASSISTANT }
+        val rendered = assistant.content
+            .filter { it.type == BlockType.TEXT }
+            .joinToString("") { it.text }
+        assertEquals("hello bar world", rendered, "UI 必须显示改写后的流式内容")
+        val logged = llmEvents.filterIsInstance<LlmEvent.TextDelta>().joinToString("") { it.text }
+        assertEquals("hello bar world", logged, "run.jsonl 与 UI 看到同一份改写")
+        val session = assertNotNull(repo.load(gateway.session!!.header.id))
+        assertTrue(session.events.toString().contains("hello bar world"), "落盘的 assistant 正文也是改写后的")
+        assertFalse(session.events.toString().contains("hello foo world"))
+    }
+
+    @Test
+    fun preStepInjectsUserMessageBeforeTheRequest() = runBlocking {
+        responses += textResponse("ok")
+        var seenStep: StepView? = null
+        val chain = RequestMiddlewareChain(
+            listOf(object : RequestMiddleware {
+                override val id: String = "p/pre"
+                override suspend fun preStep(step: StepView): List<String> {
+                    seenStep = step
+                    return listOf("PLUGIN-NOTE")
+                }
+            }),
+        )
+        engine(requestMiddleware = { chain }).startTurn(ui, TurnInput("hi"))
+
+        val step = assertNotNull(seenStep)
+        assertEquals("hi", step.lastUserText)
+        assertEquals(1, step.step)
+        assertTrue(requests.single().allText().contains("PLUGIN-NOTE"), "注入要进本次请求")
+
+        val rendered = assertNotNull(repo.load(gateway.session!!.header.id))
+            .events
+            .filter { it.type == "user/message" }
+            .map { it.data.toString() }
+        assertEquals(2, rendered.size, "第一条是用户输入、第二条是插件注入")
+        assertTrue(rendered[0].contains("\"hi\""), "用户消息在前：${rendered[0]}")
+        assertTrue(rendered[1].contains("PLUGIN-NOTE"), "插件注入在后：${rendered[1]}")
+        assertTrue(rendered[1].contains("plugin-inject"), "注入来源要标 plugin-inject：${rendered[1]}")
+        assertTrue(ui.messages.any { it.sourceKind == "plugin-inject" }, "UI 要折叠出注入提示")
+    }
+
+    @Test
+    fun preStepExceptionSkipsInjectionButTurnContinues() = runBlocking {
+        responses += textResponse("ok")
+        val diagnostics = mutableListOf<MiddlewareDiagnostic>()
+        val chain = RequestMiddlewareChain(
+            listOf(object : RequestMiddleware {
+                override val id: String = "p/boom"
+                override suspend fun preStep(step: StepView): List<String> = throw IllegalStateException("坏了")
+            }),
+            onDiagnostic = { diagnostics += it },
+        )
+        val outcome = engine(requestMiddleware = { chain }).startTurn(ui, TurnInput("hi"))
+
+        assertEquals(TurnOutcome.COMPLETED, outcome, "中间件异常不能打断回合")
+        assertEquals(1, diagnostics.size)
+        assertEquals("agent/pre-step", diagnostics.single().phase)
+        assertTrue(requests.single().allText().contains("hi"))
+    }
+
     // ---------------- 脚手架 ----------------
     private fun engine(
         jobNotices: () -> List<UserNotice> = { emptyList() },
@@ -1749,6 +2130,8 @@ class TurnEngineTest {
         nextQueuedInput: suspend () -> TurnInput? = { null },
         onInputDelivered: suspend (String, Long) -> Unit = { _, _ -> },
         nextSchedulePrompt: () -> String? = { null },
+        toolMiddleware: () -> ToolMiddlewareChain = { ToolMiddlewareChain.EMPTY },
+        requestMiddleware: () -> RequestMiddlewareChain = { RequestMiddlewareChain.EMPTY },
     ): TurnEngine = TurnEngine(
         EngineDeps(
             workspacePath = root.absolutePath,
@@ -1780,7 +2163,7 @@ class TurnEngineTest {
             nextSchedulePrompt = nextSchedulePrompt,
             tickSchedules = { },
             onRequest = { number, request -> requests += request; onRequest(number, request) },
-            onLlmEvent = { _, _ -> },
+            onLlmEvent = { _, event -> llmEvents += event },
             onToolResult = { _, _, _ -> },
             onTurnFinished = { },
             jobNotices = jobNotices,
@@ -1794,6 +2177,8 @@ class TurnEngineTest {
             claimSteeringInputs = claimSteeringInputs,
             nextQueuedInput = nextQueuedInput,
             onInputDelivered = onInputDelivered,
+            toolMiddleware = toolMiddleware,
+            requestMiddleware = requestMiddleware,
         ),
     )
 

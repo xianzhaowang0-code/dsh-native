@@ -62,8 +62,17 @@ internal fun NativePluginsPage(
         activeModel = host.activeModelUi,
         onSelectModel = { host.setActiveModel(it) },
         onRestoreBuiltinModel = host::restoreBuiltinModel,
+        // M88-E：AI 授予的可见性（横幅撤销 / 详情审计 / 权限行「AI 授予」）。
+        onUndoAiGrant = { host.undoAiPluginGrant() },
+        pluginAuditLines = { pluginId -> host.pluginAuditLines(pluginId) },
+        aiGrantedPermissions = { pluginId -> host.aiGrantedPermissions(pluginId) },
         capabilityTargets = host.capabilityUi,
         capabilityNotice = host.capabilityNotice,
         onInvokeCapability = host::invokeCapability,
+        // M87-F：扩展点页签 + 插件中间件总开关。
+        pluginExtensions = host.pluginExtensionsUi,
+        pluginMiddlewareEnabled = host.pluginMiddlewareEnabled,
+        onTogglePluginMiddleware = host::setPluginMiddlewareEnabled,
+        onRefreshExtensions = host::refreshPluginExtensions,
     )
 }

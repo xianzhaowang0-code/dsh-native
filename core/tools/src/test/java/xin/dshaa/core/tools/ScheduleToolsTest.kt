@@ -159,6 +159,6 @@ class ScheduleToolsTest {
         val names = BuiltinToolCatalog.allTools().map { it.name }
         assertTrue("schedule_create" in names)
         assertTrue("schedule_delete" in names)
-        assertEquals(32, names.size)
+        assertEquals(33, names.size)
     }
 }

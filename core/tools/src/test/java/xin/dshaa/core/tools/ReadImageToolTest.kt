@@ -16,7 +16,7 @@ import kotlin.test.assertTrue
 
 /**
  * `read_image` 的行为契约（对齐上游 `dsh-tool-fs/read-image`）：
- * 参数/后缀/能力门先拒绝 → 读字节 + 文件头嗅探 → 附件归一化 → `<path>/<type>/<content>` 信封。
+ * 参数/后缀/能力门先拒绝 → 只读文件头嗅探 → 附件流式归一化 → `<path>/<type>/<content>` 信封。
  * 用假 AttachmentHost，位图归一化另在 :core:attachment 测。
  */
 class ReadImageToolTest {
@@ -37,6 +37,7 @@ class ReadImageToolTest {
         var savedData: ByteArray? = null
         var savedMediaType: String? = null
         var savedName: String? = null
+        var savedFile: File? = null
         var failure: ImageStoreException? = null
 
         override suspend fun saveImage(data: ByteArray, mediaType: String, name: String?): ImageRef {
@@ -45,6 +46,15 @@ class ReadImageToolTest {
             savedName = name
             failure?.let { throw it }
             return ref(data, mediaType)
+        }
+
+        // M88-H：流式入口——只记录 File（不整读），证明工具没有把源文件读进内存。
+        override suspend fun saveImageFile(file: File, mediaType: String, name: String?): ImageRef {
+            savedFile = file
+            savedMediaType = mediaType
+            savedName = name
+            failure?.let { throw it }
+            return ref(ByteArray(0), mediaType)
         }
     }
 
@@ -83,8 +93,25 @@ class ReadImageToolTest {
     }
 
     @Test
-    fun hiddenFileHasNoExtension() {
-        // Node path.extname(".hidden") == ""：隐藏文件当「无后缀」，按字节嗅探
+    fun largeImageFileIsAcceptedWithoutByteLimitAndNotReadIntoMemory() {
+        // M88-H：用户要求文件/图片引用不要 50MB 上限。60MB 稀疏文件也必须被接受；
+        // 工具只读文件头，源文件以 File 交给附件层流式处理（savedData 仍为 null）。
+        val host = FakeHost()
+        val file = File(workspace, "huge.png")
+        java.io.RandomAccessFile(file, "rw").use { raf ->
+            raf.write(PNG_SIGNATURE)
+            raf.setLength(60L * 1024 * 1024)
+        }
+        val result = kotlinx.coroutines.runBlocking { tool.execute(args(file.path), ctx(host)) }
+        assertTrue(!result.isError, result.text)
+        assertEquals("image/png", host.savedMediaType)
+        assertEquals(file, host.savedFile)
+        assertEquals(60L * 1024 * 1024, host.savedFile!!.length())
+        assertEquals(null, host.savedData, "不能把 60MB 源文件整读进内存")
+    }
+
+    @Test
+    fun hiddenFileHasNoExtension() {        // Node path.extname(".hidden") == ""：隐藏文件当「无后缀」，按字节嗅探
         val host = FakeHost()
         val file = File(workspace, ".hidden").apply { writeBytes(PNG_SIGNATURE) }
         val result = kotlinx.coroutines.runBlocking { tool.execute(args(file.path), ctx(host)) }
@@ -130,7 +157,9 @@ class ReadImageToolTest {
         assertTrue(!result.isError, result.text)
         assertEquals("image/png", host.savedMediaType)
         assertEquals("shot", host.savedName)
-        assertEquals((PNG_SIGNATURE + byteArrayOf(1, 2, 3)).toList(), host.savedData!!.toList())
+        // M88-H：工具只把 File 交给附件层（只读文件头），不再把整份字节读进内存。
+        assertEquals(file, host.savedFile)
+        assertEquals(null, host.savedData)
         assertContains(result.text, "<path>${file.path}</path>")
     }
 
@@ -203,7 +232,7 @@ class ReadImageToolTest {
         }
         assertContains(message(ImageStoreException.Code.IMAGE_DIMENSION_TOO_LARGE), "at least one image side exceeds the 65535px limit")
         assertContains(message(ImageStoreException.Code.IMAGE_TOO_MANY_PIXELS), "the image exceeds the 64000000-pixel decoded-size limit")
-        assertContains(message(ImageStoreException.Code.IMAGE_TOO_LARGE), "the image cannot be stored within the deployment's byte limits")
+        assertContains(message(ImageStoreException.Code.IMAGE_TOO_LARGE), "the image cannot be normalized within the deployment's output size limits")
     }
 
     @Test

@@ -6,6 +6,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -443,7 +444,24 @@ open class SessionSession(
         data: kotlinx.serialization.json.JsonObject,
         surfaceOp: kotlinx.serialization.json.JsonElement? = null,
         sourceEventSeqs: List<Long>? = null,
+        /** M87-E：宿主补写的可信事件（拒绝后的错误 tool_result）绕过写入钩子，避免二次拒绝。 */
+        trusted: Boolean = false,
     ): Long {
+        if (!trusted) {
+            val sourceKind = ((data["source"] as? JsonObject)?.get("kind") as? JsonPrimitive)?.contentOrNull
+            val decision = SessionWriteHooks.check(
+                PendingSessionEvent(
+                    sessionId = header.id,
+                    type = type,
+                    dataJson = data.toString(),
+                    surfaceOpJson = surfaceOp?.toString(),
+                    sourceKind = sourceKind,
+                ),
+            )
+            if (!decision.allow) {
+                throw SessionAppendVetoed(type, decision.pluginId, decision.reason ?: "插件拒绝写入")
+            }
+        }
         val mySeq = seq++
         val now = System.currentTimeMillis()
         val line = SessionCodec.encodeEvent(type, mySeq, now, data, surfaceOp, sourceEventSeqs)
@@ -736,8 +754,26 @@ open class SessionSession(
         },
     )
 
-    fun appendToolResult(callId: String, text: String, isError: Boolean, images: List<ImageRef> = emptyList()): Long = appendRaw(
+    fun appendToolResult(callId: String, text: String, isError: Boolean, images: List<ImageRef> = emptyList()): Long =
+        appendRaw("tool/result", toolResultData(callId, text, isError, images), surfaceOp = JsonPrimitive("append"))
+
+    /**
+     * M87-E：宿主在插件拒绝写入真实工具结果后补写的错误结果（绕过写入钩子，回合保持完整）。
+     * 插件的原始结果没有落盘；这条只说明「被谁拒绝、原因是什么」。
+     */
+    fun appendToolResultTrusted(
+        callId: String,
+        text: String,
+        isError: Boolean,
+        images: List<ImageRef> = emptyList(),
+    ): Long = appendRaw(
         "tool/result",
+        toolResultData(callId, text, isError, images),
+        surfaceOp = JsonPrimitive("append"),
+        trusted = true,
+    )
+
+    private fun toolResultData(callId: String, text: String, isError: Boolean, images: List<ImageRef>): JsonObject =
         buildJsonObject {
             put("turn", turn)
             put("step", step)
@@ -758,9 +794,7 @@ open class SessionSession(
                     put("id", UUID.randomUUID().toString())
                 },
             )
-        },
-        surfaceOp = JsonPrimitive("append"),
-    )
+        }
 
     // ---- 上下文压缩（M43）：上游 `dsh-compaction-basic` 的 bracket 事务 ----
     //

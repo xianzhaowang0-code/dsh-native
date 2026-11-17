@@ -311,6 +311,10 @@ class MainActivity : ComponentActivity() {
             }
         }
         enableEdgeToEdge()
+        // M87-H5：插件通知点击（冷启动）→ 落地聊天页；不深链到某个会话/插件页。
+        if (intent?.action == xin.dshaa.nativeapp.data.PluginNotifier.ACTION_OPEN_CHAT) {
+            appVm.requestLandingChat()
+        }
         // Preserve arrivals across rotation/recreate while the boot gate is still closed.
         if (BuildConfig.DEBUG) {
             val restored = savedInstanceState?.getParcelableArrayList<Intent>("dsh.pendingBootIntents")
@@ -561,6 +565,10 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        // M87-H5：插件通知点击（App 已在前台/后台）→ 落地聊天页。
+        if (intent.action == xin.dshaa.nativeapp.data.PluginNotifier.ACTION_OPEN_CHAT) {
+            appVm.requestLandingChat()
+        }
         // M84-A：内置插件验收不重建 Activity（VM 里的开关直接改，tools[] 现算）
         if (BuildConfig.DEBUG) {
             pendingBootIntents.addLast(Intent(intent) to true)

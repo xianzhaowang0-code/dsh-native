@@ -38,6 +38,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -51,10 +52,14 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import xin.dshaa.nativeapp.device.DevicePermissions
 import xin.dshaa.nativeapp.device.DevicePermissions.ShizukuState
+import xin.dshaa.nativeapp.device.DeviceShell
+import xin.dshaa.nativeapp.device.ShellStatus
 import xin.dshaa.ui.design.theme.DshTheme2
 
 /** 设备能力项的 id：每项都能「查 + 去授权」，界面只认这个枚举。 */
@@ -316,6 +321,7 @@ fun PermissionsScreen(onBack: () -> Unit) {
         PermissionChecklist(
             modifier = Modifier.padding(horizontal = 14.dp),
             bottomSlot = {
+                ShellIdentityCard()
                 Text(
                     "Shizuku 需要先装官方 App 并启动服务（无线调试/USB 启动过一次即可）；" +
                         "无障碍在系统设置里属于「已下载的服务」。这两项不开，虚拟屏和读屏就用不了。",
@@ -326,4 +332,80 @@ fun PermissionsScreen(onBack: () -> Unit) {
             },
         )
     }
+}
+
+/**
+ * M87-H7：「Shell 身份」行——当前命令会以 root / Shizuku / App 哪个身份执行，为什么。
+ *
+ * 探测放 IO（`su` 可能弹授权框），本页只读缓存；「重新检测」显式再探一次。
+ */
+@Composable
+private fun ShellIdentityCard() {
+    val c = DshTheme2.colors
+    var status by remember { mutableStateOf<ShellStatus?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    suspend fun refresh(force: Boolean) {
+        busy = true
+        status = withContext(Dispatchers.IO) {
+            if (force) DeviceShell.probeRoot(force = true)
+            DeviceShell.shellStatus()
+        }
+        busy = false
+    }
+
+    LaunchedEffect(Unit) { refresh(false) }
+
+    Column(Modifier.fillMaxWidth().padding(top = 6.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Rounded.Terminal, null, tint = c.brand, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("Shell 身份", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Medium, color = c.text)
+        }
+        val current = status
+        if (current == null) {
+            Text(
+                if (busy) "正在检测 root / Shizuku…" else "还没检测",
+                style = MaterialTheme.typography.labelSmall,
+                color = c.faint,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+        } else {
+            Text(
+                "当前身份：${identityLabel(current.defaultIdentity)}" +
+                    "（root ${if (current.root) "✓" else "—"} · Shizuku ${if (current.shizukuPermission) "✓" else "—"}）",
+                style = MaterialTheme.typography.bodySmall,
+                color = c.text,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+            Text(
+                // M88-B（docs/183 §2）：root 与 Shizuku 已合并成一条身份链，命令自动选择。
+                "选择顺序：root → Shizuku → App（root 优先，无 root 自动用 Shizuku）",
+                style = MaterialTheme.typography.labelSmall,
+                color = c.faint,
+                modifier = Modifier.padding(top = 2.dp),
+            )
+            Text(
+                current.reason + if (current.rootCommand != null) "（探测写法：${current.rootCommand}）" else "",
+                style = MaterialTheme.typography.labelSmall,
+                color = c.faint,
+                modifier = Modifier.padding(top = 2.dp),
+            )
+        }
+        Text(
+            if (busy) "检测中…" else "重新检测",
+            style = MaterialTheme.typography.labelMedium,
+            color = if (busy) c.faint else c.brand,
+            modifier = Modifier
+                .padding(top = 6.dp)
+                .clickable(enabled = !busy) { scope.launch { refresh(true) } },
+        )
+    }
+}
+
+private fun identityLabel(identity: String): String = when (identity) {
+    "root" -> "root"
+    "shizuku" -> "Shizuku（ADB 级）"
+    else -> "App（普通应用身份）"
 }

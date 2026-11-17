@@ -35,6 +35,7 @@ import xin.dshaa.core.session.GoalIdleDecision
 import xin.dshaa.core.session.GoalRoundDriver
 import xin.dshaa.core.session.GoalRoundRef
 import xin.dshaa.core.session.SessionSession
+import xin.dshaa.core.session.SessionAppendVetoed
 import xin.dshaa.core.tools.ToolResult
 import java.util.Base64
 
@@ -62,6 +63,10 @@ internal const val INTERRUPTED_TOOL_RESULT =
 internal const val TRUNCATED_TOOL_RESULT =
     "Tool call was not executed: the response hit the max_tokens limit, so its arguments may be " +
         "incomplete. Treat this call as failed; do not retry it unless the user asks."
+
+/** M87-B：`agent/pre-step` 注入的 user 消息来源（会话日志用；UI 折叠成一行）。 */
+internal const val PLUGIN_INJECT_KIND = "plugin-inject"
+internal const val PLUGIN_INJECT_SUMMARY = "插件注入"
 
 /**
  * 一轮对话的执行器：写 v4 事件、跑工具循环、按 goal activation 自动续轮。
@@ -193,46 +198,54 @@ class TurnEngine(private val deps: EngineDeps) {
         var stepNumber = 0
         // wake 轮的通知：落库时按顺序收集 seq，界面上的通知条也要带同一个 seq（M44 压缩选区用）
         val noticeSeqs = ArrayList<Long>()
-        val userSeq = withContext(Dispatchers.IO) {
-            // goal 轮是独立的 request series：上游会在 goal 消息前渲染自己的 request header
-            if (input.goalRound != null) {
-                session.appendRequestHeader(
-                    provider = provider,
-                    model = config.model,
-                    reasoningEffort = effort,
-                    maxTokens = config.maxTokens,
-                )
-            }
-            turnNumber = session.startTurn()
-            // 计划模式：pending 在 step/start **之前**落库（上游 agent/pre-step），
-            // narration 和 inbox 通知一样在 step/start 之后落成 user/message。
-            planStep = applyPendingPlan(session)
-            stepNumber = session.startStep()
-            planStep?.let { step ->
-                step.narration?.let { narration ->
-                    step.narrationSeq = session.appendUserMessageTexts(
-                        listOf(narration),
-                        source = noticeSource("plan-mode", narration),
+        val userSeq = try {
+            withContext(Dispatchers.IO) {
+                // goal 轮是独立的 request series：上游会在 goal 消息前渲染自己的 request header
+                if (input.goalRound != null) {
+                    session.appendRequestHeader(
+                        provider = provider,
+                        model = config.model,
+                        reasoningEffort = effort,
+                        maxTokens = config.maxTokens,
                     )
                 }
-            }
-            // wake 轮：完成通知在 step/start 之后落成 user/message（上游 inbox 在 step 起点 claim）
-            if (input.wake) {
-                input.notices.forEach { notice ->
-                    noticeSeqs += session.appendUserMessageTexts(
-                        notice.texts ?: listOf(notice.text),
-                        source = notice.source ?: noticeSource(notice.kind, notice.summary),
-                    )
+                turnNumber = session.startTurn()
+                // 计划模式：pending 在 step/start **之前**落库（上游 agent/pre-step），
+                // narration 和 inbox 通知一样在 step/start 之后落成 user/message。
+                planStep = applyPendingPlan(session)
+                stepNumber = session.startStep()
+                planStep?.let { step ->
+                    step.narration?.let { narration ->
+                        step.narrationSeq = session.appendUserMessageTexts(
+                            listOf(narration),
+                            source = noticeSource("plan-mode", narration),
+                        )
+                    }
                 }
-                null
-            } else {
-                if (input.images.isEmpty()) {
-                    session.appendUserMessageTexts(input.userTexts, source = goalSource)
+                // wake 轮：完成通知在 step/start 之后落成 user/message（上游 inbox 在 step 起点 claim）
+                if (input.wake) {
+                    input.notices.forEach { notice ->
+                        noticeSeqs += session.appendUserMessageTexts(
+                            notice.texts ?: listOf(notice.text),
+                            source = notice.source ?: noticeSource(notice.kind, notice.summary),
+                        )
+                    }
+                    null
                 } else {
-                    // 用户附件（docs/42）：text 块 + image 块落在同一条 user/message 里
-                    session.appendUserMessageContent(input.userTexts, input.images, source = goalSource)
+                    if (input.images.isEmpty()) {
+                        session.appendUserMessageTexts(input.userTexts, source = goalSource)
+                    } else {
+                        // 用户附件（docs/42）：text 块 + image 块落在同一条 user/message 里
+                        session.appendUserMessageContent(input.userTexts, input.images, source = goalSource)
+                    }
                 }
             }
+        } catch (e: SessionAppendVetoed) {
+            // M87-E：首条用户消息/通知在 step 起点就被拒绝时，turn/start + step/start 已经落库；
+            // 这里必须补 step/end + turn/end(error)，否则会话会留下没有收口的悬空回合。
+            // try 块内的拒绝（插件注入、工具结果等）由下面的 catch 走同一套收口。
+            closeVetoedTurn(ui, session, e, turnNumber, stepNumber)
+            throw e
         }
         planStep?.let { step ->
             if (step.changed) deps.onPlanChanged()
@@ -286,6 +299,9 @@ class TurnEngine(private val deps: EngineDeps) {
         var liveAssistantIndex = -1
         // 本轮的错误文案（决定 turn/end 写 completed 还是 error；每轮开头清零，与抽出前 state.error 一致）
         var errorText: String? = null
+        // H1（docs/182）：本轮是否因 max_tokens 截断。截断也要写 error（turn/end 语义不变），
+        // 但 outcome 要能区分出来，宿主才能给「继续生成」入口（ERROR 不可续写）。
+        var truncated = false
         var activeRequestNo: Int? = null
         var requestUsage = TokenUsage()
         fun notifyUsage(status: RequestUsageStatus) {
@@ -400,6 +416,37 @@ class TurnEngine(private val deps: EngineDeps) {
                     }
                 }
 
+                // M87-B：agent/pre-step（等价上游 `agent.inject`）。插件按本步上下文注入 user 消息，
+                // 注入点在时间上下文之后、自动压缩之前（压缩会看到注入后的会话面）。
+                // 只**注入**、不裁剪历史：v1 不允许删除本步消息（否则会话日志与 UI 会不一致）。
+                val requestChain = deps.requestMiddleware()
+                if (!requestChain.isEmpty) {
+                    val lastUserText = ui.messages().lastOrNull { it.role == MessageRole.USER }
+                        ?.content?.filter { it.type == BlockType.TEXT }?.joinToString("\n") { it.text }
+                        .orEmpty()
+                    val stepView = StepView(
+                        sessionId = session.header.id,
+                        turn = turnNumber,
+                        step = stepNumber,
+                        messageCount = ui.messages().size,
+                        lastUserText = lastUserText,
+                    )
+                    val injections = withContext(Dispatchers.IO) { requestChain.preStep(stepView) }
+                    injections.forEach { text ->
+                        val seq = withContext(Dispatchers.IO) {
+                            session.appendUserMessageTexts(
+                                listOf(text),
+                                source = noticeSource(PLUGIN_INJECT_KIND, PLUGIN_INJECT_SUMMARY),
+                            )
+                        }
+                        ui.appendMessage(
+                            noticeMessage(
+                                UserNotice(text = text, summary = PLUGIN_INJECT_SUMMARY, kind = PLUGIN_INJECT_KIND),
+                            ).copy(seq = seq),
+                        )
+                    }
+                }
+
                 // 自动压缩（M44，上游 `agent/pre-step` 的压力监听）：注入都落完、本 step 请求之前
                 // 估一次会话面；越过阈值就先把最早一段换成 checkpoint，再按新的会话面组装请求。
                 // M84-C2：step 钩子（注入落完、请求之前；step/end 前另有一次 onStepEnd）。
@@ -495,7 +542,7 @@ class TurnEngine(private val deps: EngineDeps) {
                     activeRequestNo = requestNo + 1
                     notifyUsage(RequestUsageStatus.STARTED)
                     ui.setUsage(null)
-                    val request = buildRequest(ui.messages().dropLast(1), config, effort)
+                    val request = buildRequest(ui.messages().dropLast(1), config, effort, session.header.id)
                     val turnRequestNo = requestNo
                     var failedEvent: LlmEvent.Failed? = null
                     // 图片卸载（M47）：上游由适配器按路由图片预算报 `IMAGE_OFFLOAD_REQUIRED`；
@@ -516,7 +563,16 @@ class TurnEngine(private val deps: EngineDeps) {
                     } else {
                         deps.stream(request, config)
                     }
-                    events.collect { event ->
+                    // M87-B：llm/stream 在**下发之前**改写文本/思考增量，因此 UI 与落盘（run.jsonl）
+                    // 看到的是同一份改写后内容；链为空时原样透传（零开销）。
+                    val streamChain = deps.requestMiddleware()
+                    val streamContext = RequestContext(
+                        sessionId = session.header.id,
+                        provider = deps.providerLabel(),
+                        model = config.model,
+                    )
+                    events.collect { incoming ->
+                        val event = applyStreamMiddleware(streamChain, streamContext, incoming)
                         deps.onLlmEvent(turnRequestNo, event)
                         when (event) {
                             is LlmEvent.TextDelta -> {
@@ -677,16 +733,14 @@ class TurnEngine(private val deps: EngineDeps) {
                 if (stopReason == "max_tokens" && toolCalls.isNotEmpty()) {
                     toolCalls.forEach { call ->
                         if (runCatching { session.hasToolResult(call.id) }.getOrDefault(false)) return@forEach
-                        val seq = withContext(Dispatchers.IO) {
-                            session.appendToolResult(call.id, TRUNCATED_TOOL_RESULT, true)
-                        }
+                        val appended = appendToolResultGuarded(session, call.id, TRUNCATED_TOOL_RESULT, true)
                         ui.appendMessage(
                             ChatMessage(
                                 id = deps.newId(),
                                 role = MessageRole.TOOL,
-                                content = listOf(ContentBlock(BlockType.TEXT, text = TRUNCATED_TOOL_RESULT)),
+                                content = listOf(ContentBlock(BlockType.TEXT, text = appended.text)),
                                 toolCallId = call.id,
-                                seq = seq,
+                                seq = appended.seq,
                             ),
                         )
                         pendingToolCalls.removeAll { it.id == call.id }
@@ -695,7 +749,8 @@ class TurnEngine(private val deps: EngineDeps) {
                         "max_tokens: truncated response carried ${toolCalls.size} tool call(s); " +
                             "persisted without executing them",
                     )
-                    errorText = "达到 max_tokens 上限，输出被截断（工具调用未执行）"
+                    truncated = true
+                    errorText = "达到 max_tokens 上限，输出被截断（工具调用未执行）；可点「继续生成」，或让我分几段写。"
                     ui.setError(errorText)
                     hookStepEnd(turnNumber, stepNumber)
                     withContext(Dispatchers.IO) { session.endStep() }
@@ -722,7 +777,8 @@ class TurnEngine(private val deps: EngineDeps) {
                     withContext(Dispatchers.IO) { session.endStep() }
                     stepOpen = false
                     if (stopReason == "max_tokens") {
-                        errorText = "达到 max_tokens 上限，输出被截断"
+                        truncated = true
+                        errorText = "达到 max_tokens 上限，输出被截断；可点「继续生成」，或让我分几段写。"
                         ui.setError(errorText)
                     }
                     break
@@ -738,42 +794,123 @@ class TurnEngine(private val deps: EngineDeps) {
                     // 每进一个工具再显式确认一次「用户是否已经点了停止」。
                     if (deps.stop.requested) throw kotlinx.coroutines.CancellationException("stopped by user")
                     ui.setStatus("运行工具 ${call.name}…")
-                    if (!deps.approval(call)) {
-                        val denied = ToolResult.err("User denied this tool call.")
-                        deps.onToolResult(call, denied.text, true)
-                        val seq = withContext(Dispatchers.IO) { session.appendToolResult(call.id, denied.text, true) }
+                    // M88-G（docs/183 §7）：执行前先查参数完整性与长度。
+                    // 以前 `parseArgs` 对半截 JSON 静默返回 {}，工具拿空参数执行，用户看到的就是
+                    // 「调用工具后停了、没反应」。现在落一条显式 error tool_result 让模型拆小重试，
+                    // 回合继续（不 break）：模型可以在同一次 turn 里改用合法/更短的参数。
+                    val inputError = ToolInputGuard.violation(call.name, call.arguments)
+                    if (inputError != null) {
+                        deps.log(
+                            "tool-input: call=${call.id} tool=${call.name} " +
+                                "bytes=${ToolInputGuard.byteSize(call.arguments)} rejected",
+                        )
+                        val bad = ToolResult.err(inputError)
+                        deps.onToolResult(call, bad.text, true)
+                        val appended = appendToolResultGuarded(session, call.id, bad.text, true)
                         ui.appendMessage(
                             ChatMessage(
                                 id = deps.newId(),
                                 role = MessageRole.TOOL,
-                                content = listOf(ContentBlock(BlockType.TEXT, text = denied.text)),
+                                content = listOf(ContentBlock(BlockType.TEXT, text = appended.text)),
                                 toolCallId = call.id,
-                                seq = seq,
+                                seq = appended.seq,
+                            ),
+                        )
+                        pendingToolCalls.removeAll { it.id == call.id }
+                        ui.setStatus("工具输入有误")
+                        continue
+                    }
+                    val callView = ToolCallView.of(call, ToolInputGuard.parseStrict(call.arguments) ?: buildJsonObject { })
+                    // M87-A（docs/181 §3.2）：一次工具调用取一份链快照；guard/pre/post/result 都走它。
+                    val toolMiddleware = deps.toolMiddleware()
+                    // M87-A：guard 在审批**之前**拒绝；和「用户拒绝」同形——
+                    // 落一条 error tool_result 保持 tool_use/tool_result 配对，模型能看到拒绝原因。
+                    // 链非空时放到 IO 线程（插件 JS 往返有 50ms 预算，不阻塞主线程）。
+                    val guard = if (toolMiddleware.isEmpty) {
+                        null
+                    } else {
+                        withContext(Dispatchers.IO) { toolMiddleware.guard(callView) }
+                    }
+                    // M87-A：restrict 不只是「从 tools[] 里删掉」。模型可能凭空 emit 一个被隐藏的
+                    // 工具名（幻觉/提示注入），执行前必须再查一次，否则 restrict 形同虚设。
+                    val restricted = !toolMiddleware.isEmpty && !toolMiddleware.allowsTool(call.name)
+                    val denialText = when {
+                        restricted -> {
+                            deps.log("tool-restrict: ${call.name} blocked by restrict rules")
+                            "工具 ${call.name} 已被插件的 restrict 规则禁用，本次调用未执行。"
+                        }
+                        guard != null -> {
+                            deps.log("tool-guard: ${call.name} denied by ${guard.middlewareId}")
+                            guard.message
+                        }
+                        !deps.approval(call) -> "User denied this tool call."
+                        else -> null
+                    }
+                    if (denialText != null) {
+                        val denied = ToolResult.err(denialText)
+                        deps.onToolResult(call, denied.text, true)
+                        val appended = appendToolResultGuarded(session, call.id, denied.text, true)
+                        ui.appendMessage(
+                            ChatMessage(
+                                id = deps.newId(),
+                                role = MessageRole.TOOL,
+                                content = listOf(ContentBlock(BlockType.TEXT, text = appended.text)),
+                                toolCallId = call.id,
+                                seq = appended.seq,
                             ),
                         )
                         pendingToolCalls.removeAll { it.id == call.id }
                         ui.setStatus("已拒绝")
                         continue
                     }
-                    val args = parseArgs(call.arguments)
+                    // M87-A：pre-execute 改参数（只改这一次执行；会话里已落库的是模型原始调用）。
+                    val prepared = toolMiddleware.preExecute(callView)
+                    if (prepared.rewritten) {
+                        deps.log(
+                            "tool-pre-execute: ${call.name} rewritten by " +
+                                "${prepared.appliedBy.joinToString(",")} original=${prepared.originalHash}",
+                        )
+                    }
                     // M84-C2：工具执行前后的观察钩子（审批通过、真正执行才触发；拒绝路径不触发）。
                     hookToolStart(call)
-                    val result = deps.registry.execute(call.name, args, deps.toolContext)
-                    hookToolEnd(call, result)
-                    deps.onToolResult(call, result.text, result.isError)
-                    val resultSeq = withContext(Dispatchers.IO) {
-                        session.appendToolResult(call.id, result.text, result.isError, result.images)
+                    val rawResult = deps.registry.execute(prepared.value.name, prepared.value.args, deps.toolContext)
+                    // M87-A：post-execute 改结果（工具卡/模型看到的都是改写后的值；原始哈希进诊断）。
+                    val executed = toolMiddleware.postExecute(prepared.value, rawResult)
+                    val result = executed.value
+                    if (executed.rewritten) {
+                        deps.log(
+                            "tool-post-execute: ${call.name} rewritten by " +
+                                "${executed.appliedBy.joinToString(",")} original=${executed.originalHash}",
+                        )
                     }
+                    hookToolEnd(call, result)
+                    toolMiddleware.observe(prepared.value, result)
+                    deps.onToolResult(call, result.text, result.isError)
+                    val appended = appendToolResultGuarded(
+                        session,
+                        call.id,
+                        result.text,
+                        result.isError,
+                        result.images,
+                    )
                     ui.appendMessage(
                         ChatMessage(
                             id = deps.newId(),
                             role = MessageRole.TOOL,
                             content = buildList {
-                                add(ContentBlock(BlockType.TEXT, text = result.text))
-                                result.images.forEach { add(it.toContentBlock()) }
+                                add(ContentBlock(BlockType.TEXT, text = appended.text))
+                                if (!appended.vetoed) result.images.forEach { add(it.toContentBlock()) }
                             },
                             toolCallId = call.id,
-                            seq = resultSeq,
+                            seq = appended.seq,
+                            // M87-A：结果被插件改写时，工具卡标「已由 <插件> 改写」并带原始哈希
+                            // （只进 UI 模型，不写会话 JSONL，也不改模型看到的结果正文）。
+                            sourceSummary = if (executed.rewritten) {
+                                "已由 ${executed.appliedBy.joinToString("、")} 改写" +
+                                    (executed.originalHash?.let { "（原始 $it）" } ?: "")
+                            } else {
+                                null
+                            },
                         ),
                     )
                     pendingToolCalls.removeAll { it.id == call.id }
@@ -814,6 +951,9 @@ class TurnEngine(private val deps: EngineDeps) {
             }
             withContext(Dispatchers.IO) { session.endTurn(if (errorText == null) "completed" else "error") }
             return when {
+                // H1：截断仍是 error（turn/end 语义不变），但 outcome 单独给 MAX_TOKENS：
+                // 宿主据此显示「继续生成」；ERROR（请求失败等）不可续写。
+                truncated -> TurnOutcome.MAX_TOKENS
                 errorText != null -> TurnOutcome.ERROR
                 lastStopReason == "max_tokens" -> TurnOutcome.MAX_TOKENS
                 else -> TurnOutcome.COMPLETED
@@ -891,6 +1031,12 @@ class TurnEngine(private val deps: EngineDeps) {
                 withContext(Dispatchers.IO) { session.endTurn("error") }
                 GoalRoundDriver(deps.goals(session)).disarm()
             }
+            throw e
+        } catch (e: SessionAppendVetoed) {
+            // M87-E：插件拒绝写入（before-append / 插件记录 veto）。这条事件没落盘，
+            // 但回合必须收口（step/turn 平衡），UI 显示结构化原因。
+            closeVetoedTurn(ui, session, e, turnNumber, if (stepOpen) stepNumber else 0)
+            stepOpen = false
             throw e
         } finally {
             // A provider may throw rather than emit Failed; still close this attempt's usage lifecycle.
@@ -970,6 +1116,65 @@ class TurnEngine(private val deps: EngineDeps) {
         runCatching { deps.jobNotices() }.getOrElse { emptyList() }
 
     /**
+     * M87-E：插件在落盘前拒绝一条会话事件（user/message、tool/result 之外由 Tool 补写路径处理）
+     * 时统一收口：UI 错误 + 引擎 hook + step/turn 平衡。
+     *
+     * 首条用户消息在 [runTurn] 的 try 之前落库，拒绝时也走这里（见调用点）；
+     * [step] 传 0 表示本次拒绝发生在 step/start 之前，不需要补 step/end；
+     * [turn] 传 0 表示 turn/start 之前（目前只有 goal 请求头可能，实际不可拒绝），不补 turn/end。
+     */
+    private suspend fun closeVetoedTurn(
+        ui: TurnUi,
+        session: SessionSession,
+        e: SessionAppendVetoed,
+        turn: Int,
+        step: Int,
+    ) {
+        withContext(NonCancellable) {
+            val message = e.message ?: "插件拒绝写入会话"
+            ui.setError(message)
+            hookError(EngineFailure(message, "PLUGIN_APPEND_VETOED", null))
+            if (step > 0) {
+                hookStepEnd(turn, step)
+                withContext(Dispatchers.IO) { session.endStep() }
+            }
+            if (turn > 0) withContext(Dispatchers.IO) { session.endTurn("error") }
+            GoalRoundDriver(deps.goals(session)).disarm()
+        }
+    }
+
+    /**
+     * M87-E：写工具结果时接住插件的 before-append 拒绝。
+     *
+     * 原始结果**不落盘**；宿主补一条 trusted 错误结果（绕过钩子）保持 assistant tool_use
+     * 与 tool_result 配对，回合可以继续（模型会看到「被插件拒绝」而不是工具输出）。
+     * 工具卡/UI 用返回的 [text] 展示同一条失败文案。
+     */
+    private suspend fun appendToolResultGuarded(
+        session: SessionSession,
+        callId: String,
+        text: String,
+        isError: Boolean,
+        images: List<ImageRef> = emptyList(),
+    ): GuardedToolResult = try {
+        val seq = withContext(Dispatchers.IO) { session.appendToolResult(callId, text, isError, images) }
+        GuardedToolResult(seq, text, isError, vetoed = false)
+    } catch (e: SessionAppendVetoed) {
+        val message = e.message ?: "插件拒绝写入工具结果"
+        deps.log("tool-result-veto: call=$callId $message")
+        val fallback = "工具结果被插件拒绝写入（$message）。宿主已保留失败状态，原始输出未落盘。"
+        val seq = withContext(Dispatchers.IO) { session.appendToolResultTrusted(callId, fallback, true) }
+        GuardedToolResult(seq, fallback, isError = true, vetoed = true)
+    }
+
+    private data class GuardedToolResult(
+        val seq: Long,
+        val text: String,
+        val isError: Boolean,
+        val vetoed: Boolean,
+    )
+
+    /**
      * 把后台任务通知落成 `user/message`（上游 `source.kind:"tool-jobs", form:"notice"`）。
      * 正文是给模型的内部通知，界面按 [UserNotice.summary] 渲染成一条分隔条。
      */
@@ -1000,7 +1205,40 @@ class TurnEngine(private val deps: EngineDeps) {
         sourceSummary = notice.summary,
     )
 
-    private fun buildRequest(messages: List<ChatMessage>, config: LlmConfig, effort: String): ApiRequest {
+    /**
+     * M87-B：对一条流式事件套 `llm/stream` 中间件。
+     *
+     * 只改写文本/思考增量（v1）：工具参数增量与生命周期事件不开放改写，否则会破坏状态机；
+     * 插件只能改进度内容。链为空或文本为空时直接返回同一个对象（零额外分配/调度）。
+     */
+    private suspend fun applyStreamMiddleware(
+        chain: RequestMiddlewareChain,
+        context: RequestContext,
+        event: LlmEvent,
+    ): LlmEvent {
+        if (chain.isEmpty) return event
+        val delta = when (event) {
+            is LlmEvent.TextDelta -> StreamDelta(event.index, event.text, reasoning = false)
+            is LlmEvent.ThinkingDelta -> StreamDelta(event.index, event.text, reasoning = true)
+            else -> return event
+        }
+        if (delta.text.isEmpty()) return event
+        val next = withContext(Dispatchers.IO) { chain.transformStreamDelta(delta, context) }
+        if (next == delta) return event
+        // 只采用插件给的 text：index 由宿主维护，插件改了就忽略（防止串块）。
+        return when (event) {
+            is LlmEvent.TextDelta -> event.copy(text = next.text)
+            is LlmEvent.ThinkingDelta -> event.copy(text = next.text)
+            else -> event
+        }
+    }
+
+    private suspend fun buildRequest(
+        messages: List<ChatMessage>,
+        config: LlmConfig,
+        effort: String,
+        sessionId: String,
+    ): ApiRequest {
         val apiMessages = ArrayList<ApiMessage>()
         // 运行时上下文（docs/port/02 §2.5）：是 user 消息，不是 system；抬头逐字固定。
         apiMessages += ApiMessage("user", listOf(ApiBlock.Text(deps.runtimeContext())))
@@ -1011,7 +1249,16 @@ class TurnEngine(private val deps: EngineDeps) {
         // 计划模式：这次请求的 system 会带/不带 plan:policy，按发送时的选中状态记下来
         // （上游 request/header 时的 activeAtLastHeader；用来决定切换模式要不要给模型补 narration）。
         deps.plan.activeAtLastHeader = deps.plan.selected()
-        val request = ApiRequest(
+        // M87-B：先做 system-prompt/assemble（有序拼装/替换内置段），再构造请求；
+        // 链为空时 assemble 原样返回 deps.systemPrompt() 的结果（字节不变）。
+        val chain = deps.requestMiddleware()
+        val context = RequestContext(sessionId = sessionId, provider = deps.providerLabel(), model = config.model)
+        val system = if (chain.isEmpty) {
+            deps.systemPrompt()
+        } else {
+            withContext(Dispatchers.IO) { chain.assembleSystemPrompt(deps.systemPrompt(), context) }.value
+        }
+        var request = ApiRequest(
             model = config.model,
             stream = true,
             messages = apiMessages,
@@ -1020,10 +1267,16 @@ class TurnEngine(private val deps: EngineDeps) {
             // 其余 effort ⇒ thinking enabled + output_config.effort（docs/48 §推理强度）。
             thinking = ThinkingConfig(type = if (effort == "off") "disabled" else "enabled"),
             outputConfig = if (effort == "off") null else OutputConfig(effort = effort),
-            system = deps.systemPrompt(),
+            system = system,
             temperature = config.temperature,
-            tools = deps.apiTools(),
+            // M87-A：restrict/describe 在拼请求时生效（链为空时原样返回同一个 List）。
+            tools = deps.toolMiddleware().apply(deps.apiTools()),
         )
+        // M87-B：agent/request 只改**本次请求副本**；ui.messages()/会话历史不变，
+        // 改写后的请求仍走 onRequest 落 run.jsonl（调试可回放）。
+        if (!chain.isEmpty) {
+            request = withContext(Dispatchers.IO) { chain.rewriteRequest(request, context) }.value
+        }
         deps.onRequest(++requestNo, request)
         return request
     }
@@ -1036,23 +1289,40 @@ class TurnEngine(private val deps: EngineDeps) {
      * 与上游的两处已知差别（docs/67）：原生没有「会话面里的 system/message」节点，
      * 也没有每次现拼的运行时上下文事件，所以 system 只出现一次、运行时上下文不进摘要请求。
      */
-    fun buildCompactionRequest(shadowed: List<ChatMessage>, config: LlmConfig): ApiRequest {
+    suspend fun buildCompactionRequest(shadowed: List<ChatMessage>, config: LlmConfig): ApiRequest {
         val apiMessages = ArrayList<ApiMessage>()
         appendHistory(apiMessages, shadowed)
         repairToolPairs(apiMessages)
         appendBlocks(apiMessages, "user", listOf(ApiBlock.Text(Compaction.INSTRUCTION)))
         val effort = deps.reasoningEffort()
-        return ApiRequest(
+        // M87-B：摘要请求也走同一套 system-prompt/assemble + agent/request（模型路由对摘要同样生效）；
+        // 链为空时字节不变。
+        val chain = deps.requestMiddleware()
+        val context = RequestContext(
+            sessionId = deps.sessions.current()?.header?.id.orEmpty(),
+            provider = deps.providerLabel(),
+            model = config.model,
+        )
+        val system = if (chain.isEmpty) {
+            deps.systemPrompt()
+        } else {
+            withContext(Dispatchers.IO) { chain.assembleSystemPrompt(deps.systemPrompt(), context) }.value
+        }
+        var request = ApiRequest(
             model = config.model,
             stream = true,
             messages = apiMessages,
             maxTokens = minOf(config.maxTokens, Compaction.MAX_SUMMARY_TOKENS),
             thinking = ThinkingConfig(type = if (effort == "off") "disabled" else "enabled"),
             outputConfig = if (effort == "off") null else OutputConfig(effort = effort),
-            system = deps.systemPrompt(),
+            system = system,
             temperature = config.temperature,
-            tools = deps.apiTools(),
+            tools = deps.toolMiddleware().apply(deps.apiTools()),
         )
+        if (!chain.isEmpty) {
+            request = withContext(Dispatchers.IO) { chain.rewriteRequest(request, context) }.value
+        }
+        return request
     }
 
     /** 合并同角色相邻消息（上游 serialize() 的 content[] 逐块追加语义）。 */

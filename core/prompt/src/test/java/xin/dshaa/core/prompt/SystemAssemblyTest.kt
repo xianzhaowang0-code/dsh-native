@@ -286,7 +286,8 @@ class SystemAssemblyTest {
             assertEquals(params, properties, "parameters of $name")
             assertTrue(!tool.description.isNullOrBlank(), "description of $name")
         }
-        // 上游 32 个 + 26 个 Android 设备/终端/记忆工具（18 设备终端 + 8 记忆，M56 追加）
-        assertEquals(32 + 26, tools.size)
+        // 上游 32 个 + 29 个 Android 设备/终端/记忆/能力/HTTP 工具
+        // （18 设备终端 + 8 记忆，M56 追加；M88-C 追加 capability/notify 2 个；M88-D 追加 http_request）
+        assertEquals(32 + 29, tools.size)
     }
 }

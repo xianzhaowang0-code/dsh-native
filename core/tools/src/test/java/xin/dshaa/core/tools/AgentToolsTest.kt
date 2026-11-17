@@ -190,7 +190,8 @@ class AgentToolsTest {
         listOf("subagent", "subagent_fork", "list_agents", "send_message", "interrupt_agent").forEach {
             assertTrue(it in names, "missing $it")
         }
-        // M19 起：28 + exit_plan_mode + load_workspace_dependencies + skill = 31；M23 加 workflow = 32
-        assertEquals(32, names.size)
+        // M19 起：28 + exit_plan_mode + load_workspace_dependencies + skill = 31；M23 加 workflow = 32；
+        // M88-D 加 http_request = 33
+        assertEquals(33, names.size)
     }
 }

@@ -1,6 +1,9 @@
 package xin.dshaa.nativeapp.ui.plugins
 
+import android.Manifest
 import android.net.Uri
+import android.os.Build
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
@@ -67,6 +70,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -76,13 +80,17 @@ import androidx.compose.ui.window.Dialog
 import xin.dshaa.core.plugins.PluginCapabilities
 import xin.dshaa.core.plugins.PluginCapability
 import xin.dshaa.core.plugins.PluginPermission
+import xin.dshaa.core.plugins.PluginPermissionKind
 import xin.dshaa.core.plugins.PluginPermissions
 import xin.dshaa.core.plugins.PluginRecord
 import xin.dshaa.core.plugins.PluginSchema
+import xin.dshaa.nativeapp.device.DevicePermissions
 import xin.dshaa.ui.design.component.DshCard
 import xin.dshaa.ui.design.component.MiniChip
 import xin.dshaa.ui.design.component.SectionHeader
+import xin.dshaa.ui.design.component.SettingsSwitchRow
 import xin.dshaa.ui.design.theme.DshTheme2
+import xin.dshaa.ui.shellapi.PluginExtensionUi
 import xin.dshaa.ui.shellapi.visibleInRoleList
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -156,6 +164,15 @@ fun PluginsScreen(
     capabilityTargets: List<xin.dshaa.ui.shellapi.CapabilityUi> = emptyList(),
     capabilityNotice: String? = null,
     onInvokeCapability: (String) -> Unit = {},
+    /** M87-F：插件页「扩展点」页签（逐链快照）与中间件总开关。 */
+    pluginExtensions: List<PluginExtensionUi> = emptyList(),
+    pluginMiddlewareEnabled: Boolean = true,
+    onTogglePluginMiddleware: (Boolean) -> Unit = {},
+    onRefreshExtensions: () -> Unit = {},
+    /** M88-E：AI 授予后的横幅「撤销」与详情审计/AI 授予标记。 */
+    onUndoAiGrant: () -> Unit = {},
+    pluginAuditLines: (String) -> List<String> = { emptyList() },
+    aiGrantedPermissions: (String) -> Set<String> = { emptySet() },
 ) {
     val c = DshTheme2.colors
     // 详情按 id 从最新的 plugins 里取：授权/重新加载后弹层立刻翻状态，不拿旧 record。
@@ -194,6 +211,8 @@ fun PluginsScreen(
     }
 
     LaunchedEffect(Unit) { onRefresh() }
+    // M87-F：切到「扩展点」页签时重算一次快照（命中/耗时只在本进程内存里）。
+    LaunchedEffect(tab) { if (tab == 3) onRefreshExtensions() }
 
     Column(Modifier.fillMaxSize().background(c.background)) {
         Row(
@@ -227,7 +246,7 @@ fun PluginsScreen(
         }
 
         TabRow(selectedTabIndex = tab, containerColor = c.surface, contentColor = c.brand) {
-            listOf("导入", "内置", "角色").forEachIndexed { index, label ->
+            listOf("导入", "内置", "角色", "扩展点").forEachIndexed { index, label ->
                 Tab(selected = tab == index, onClick = { tab = index }, text = { Text(label) })
             }
         }
@@ -244,7 +263,17 @@ fun PluginsScreen(
             contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 110.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            if (notice != null) item { NoticeBanner(notice, onDismissNotice) }
+            if (notice != null) item {
+                NoticeBanner(
+                    notice,
+                    onDismissNotice,
+                    onUndo = if (notice.startsWith("AI 已授予")) {
+                        { onUndoAiGrant() }
+                    } else {
+                        null
+                    },
+                )
+            }
             when (tab) {
                 0 -> {
                     item { ImportCard(busy = busy, onPick = { picker.launch(arrayOf("*/*")) }) }
@@ -332,6 +361,46 @@ fun PluginsScreen(
                         DshCard(Modifier.fillMaxWidth()) { CapabilityRow(target) { onInvokeCapability(target.id) } }
                     }
                 }
+                3 -> {
+                    // M87-F：总开关 + 逐链快照（注册者/顺序/命中/耗时/异常/改写哈希）。
+                    item {
+                        DshCard(Modifier.fillMaxWidth()) {
+                            SettingsSwitchRow(
+                                title = "插件中间件总开关",
+                                subtitle = "关闭后工具/请求/存储/事件钩子全部旁路（排障用）；插槽与插件注册不受影响",
+                                checked = pluginMiddlewareEnabled,
+                                onCheckedChange = onTogglePluginMiddleware,
+                            )
+                        }
+                    }
+                    item {
+                        Text(
+                            "逐链快照（插件清单顺序 = 链顺序）。命中/耗时只统计本次进程；没有 dispatch 过的显示「尚未命中」。",
+                            color = c.faint,
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                    }
+                    val visible = pluginExtensions.filter {
+                        query.isBlank() || it.pluginId.contains(query.trim(), true) ||
+                            it.pluginName.contains(query.trim(), true)
+                    }
+                    if (visible.isEmpty()) item {
+                        DshCard(Modifier.fillMaxWidth()) {
+                            Text(
+                                when {
+                                    plugins.none { it.enabled } -> "没有启用中的插件"
+                                    query.isNotBlank() -> "没有匹配的插件"
+                                    else -> "已启用的插件没有注册中间件/钩子/插槽"
+                                },
+                                color = c.faint,
+                                modifier = Modifier.padding(14.dp),
+                            )
+                        }
+                    }
+                    items(visible, key = { it.pluginId }) { row ->
+                        PluginExtensionCard(row)
+                    }
+                }
             }
         }
     }
@@ -354,6 +423,8 @@ fun PluginsScreen(
         PluginDetailDialog(
             record = record,
             injectedTools = injected[record.id].orEmpty(),
+            auditLines = pluginAuditLines(record.id),
+            aiGranted = aiGrantedPermissions(record.id),
             onDismiss = { detailId = null },
             onReload = {
                 detailId = null
@@ -397,6 +468,70 @@ fun PluginsScreen(
 
     if (showCapabilities) {
         CapabilityDialog(onDismiss = { showCapabilities = false })
+    }
+}
+
+/** M87-F：一个插件的逐链快照（扩展点页签）。 */
+@Composable
+private fun PluginExtensionCard(row: PluginExtensionUi) {
+    val c = DshTheme2.colors
+    DshCard(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("#${row.order}", color = c.faint, style = MaterialTheme.typography.labelSmall)
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    row.pluginName,
+                    fontWeight = FontWeight.SemiBold,
+                    color = c.text,
+                    modifier = Modifier.weight(1f),
+                )
+                MiniChip(if (row.enabled) "已启用" else "已停用", color = if (row.enabled) c.success else c.faint)
+            }
+            Text(row.pluginId, color = c.faint, style = MaterialTheme.typography.labelSmall)
+            row.chains.forEach { chain ->
+                Spacer(Modifier.height(8.dp))
+                Row {
+                    Text(
+                        chain.kind,
+                        color = c.brand,
+                        style = MaterialTheme.typography.labelSmall,
+                        modifier = Modifier.width(32.dp),
+                    )
+                    Column(Modifier.weight(1f)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                chain.name,
+                                color = c.text,
+                                style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Text(
+                                chain.status,
+                                color = extensionStatusColor(chain.status),
+                                style = MaterialTheme.typography.labelSmall,
+                            )
+                        }
+                        if (chain.stats.isNotBlank()) {
+                            Text(chain.stats, color = c.sub, style = MaterialTheme.typography.labelSmall)
+                        }
+                        chain.detail?.takeIf { it.isNotBlank() }?.let {
+                            Text(it, color = c.faint, style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun extensionStatusColor(status: String): androidx.compose.ui.graphics.Color {
+    val c = DshTheme2.colors
+    return when {
+        status.startsWith("生效") -> c.success
+        status.startsWith("缺授权") || status.startsWith("已停用") -> c.warn
+        else -> c.sub
     }
 }
 
@@ -499,7 +634,7 @@ private fun ImportCard(busy: Boolean, onPick: () -> Unit) {
 }
 
 @Composable
-private fun NoticeBanner(text: String, onDismiss: () -> Unit) {
+private fun NoticeBanner(text: String, onDismiss: () -> Unit, onUndo: (() -> Unit)? = null) {
     val c = DshTheme2.colors
     val failed = text.contains("报错") || text.contains("失败") || text.contains("删不掉")
     Surface(
@@ -521,6 +656,15 @@ private fun NoticeBanner(text: String, onDismiss: () -> Unit) {
                 color = c.text,
                 modifier = Modifier.weight(1f),
             )
+            // M88-E：AI 授予的横幅带一个「撤销」，不用再进插件详情找权限行。
+            onUndo?.let {
+                TextButton(
+                    onClick = it,
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                ) {
+                    Text("撤销", color = c.brand, style = MaterialTheme.typography.labelMedium)
+                }
+            }
             Box(Modifier.size(28.dp).clip(CircleShape).clickable { onDismiss() }, contentAlignment = Alignment.Center) {
                 Icon(Icons.Rounded.Close, "关闭", tint = c.faint, modifier = Modifier.size(16.dp))
             }
@@ -595,6 +739,8 @@ private fun PluginCard(
 fun PluginDetailDialog(
     record: PluginRecord,
     injectedTools: Set<String>,
+    auditLines: List<String> = emptyList(),
+    aiGranted: Set<String> = emptySet(),
     onDismiss: () -> Unit,
     onReload: () -> Unit,
     onDelete: () -> Unit,
@@ -606,6 +752,20 @@ fun PluginDetailDialog(
     val c = DshTheme2.colors
     val error = record.error
     var pendingGrant by remember { mutableStateOf<PluginPermission?>(null) }
+    // M87-H5：notify 是「插件权限 + Android 系统权限」两道门。用户确认 notify 时，
+    // Android 13+ 顺带请求 POST_NOTIFICATIONS；拒绝后权限行回显「系统通知权限未开」+ 去设置入口。
+    val context = LocalContext.current
+    var systemNotifyGranted by remember {
+        mutableStateOf(DevicePermissions.notificationPermissionGranted(context))
+    }
+    val notifyPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        systemNotifyGranted = granted
+        if (!granted) {
+            Toast.makeText(context, "系统通知权限未开：插件通知不会出现在通知栏", Toast.LENGTH_LONG).show()
+        }
+    }
     Dialog(onDismissRequest = onDismiss) {
         Surface(shape = RoundedCornerShape(22.dp), color = c.surface) {
             Column(Modifier.fillMaxWidth().heightIn(max = 580.dp).padding(20.dp)) {
@@ -635,8 +795,20 @@ fun PluginDetailDialog(
                 Spacer(Modifier.height(14.dp))
                 Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())) {
                     DetailField("插件目录", record.path)
-                    DetailField("入口", record.main)
+                    DetailField("入口", record.main.ifBlank { "—（声明式包，无 JS 入口）" })
                     DetailField("工具数", "${record.tools.size} 个 · 已接入对话 ${injectedTools.size} 个")
+                    if (record.contributions.isNotEmpty()) {
+                        // M87-G：统一包 IR 的贡献物（旧脚本包也会显示 script/client/preset）。
+                        DetailField("包格式", record.irFormat)
+                        DetailField(
+                            "贡献物",
+                            record.contributions.joinToString("\n") { contribution ->
+                                "· ${contribution.kind.label}（${contribution.kind.id}）：${contribution.id}" +
+                                    (contribution.entry?.let { " · 入口 $it" } ?: "") +
+                                    (if (contribution.assets.isNotEmpty()) " · 素材 ${contribution.assets.size} 个" else "")
+                            },
+                        )
+                    }
                     if (record.clientUi) {
                         // M71：原生替身（大肥鱼 / 3D 鲸鱼娘 / 鲸鱼娘挂件）全部删除，
                         // dsh.client 只走通用客户端插件宿主（跑插件自己的代码）。
@@ -851,11 +1023,29 @@ fun PluginDetailDialog(
                         Spacer(Modifier.height(4.dp))
                         record.permissions.forEach { raw ->
                             val permission = PluginPermissions.parse(raw) ?: return@forEach
+                            val granted = PluginPermissions.isGranted(permission, record.grantedPermissions)
                             PermissionRow(
                                 permission = permission,
-                                granted = PluginPermissions.isGranted(permission, record.grantedPermissions),
+                                granted = granted,
+                                aiGranted = permission.raw in aiGranted,
                                 onAsk = { pendingGrant = permission },
                             )
+                            // M87-H5：插件 notify 已授权但系统通知权限没开 → 给出真实原因与设置入口。
+                            if (permission.kind == PluginPermissionKind.NOTIFY && granted &&
+                                (!systemNotifyGranted || !DevicePermissions.notificationsEnabled(context))
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        "系统通知权限未开，插件通知不会显示",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = c.danger,
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                    TextButton(onClick = { DevicePermissions.openNotificationSettings(context) }) {
+                                        Text("去系统设置", color = c.brand)
+                                    }
+                                }
+                            }
                         }
                         Spacer(Modifier.height(10.dp))
                     }
@@ -916,6 +1106,25 @@ fun PluginDetailDialog(
                             color = c.sub,
                         )
                     }
+                    // M88-E：AI/用户对插件做过的最近 5 条操作（授予/撤销/配置/角色）。
+                    if (auditLines.isNotEmpty()) {
+                        Spacer(Modifier.height(10.dp))
+                        Text(
+                            "最近操作（审计）",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = c.sub,
+                            fontWeight = FontWeight.Medium,
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        auditLines.forEach { line ->
+                            Text(
+                                "· $line",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontFamily = FontFamily.Monospace,
+                                color = c.faint,
+                            )
+                        }
+                    }
                 }
 
                 Spacer(Modifier.height(14.dp))
@@ -943,6 +1152,13 @@ fun PluginDetailDialog(
                 onConfirm = {
                     pendingGrant = null
                     onGrant(permission.raw)
+                    // 勾选 notify 之后才请求系统权限（Android 13+）；低版本不需要。
+                    if (permission.kind == PluginPermissionKind.NOTIFY &&
+                        Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                        !systemNotifyGranted
+                    ) {
+                        notifyPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    }
                 },
             )
         }
@@ -1320,6 +1536,7 @@ private fun PermissionRow(
     permission: PluginPermission,
     granted: Boolean,
     onAsk: () -> Unit,
+    aiGranted: Boolean = false,
 ) {
     val c = DshTheme2.colors
     Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -1334,7 +1551,7 @@ private fun PermissionRow(
             Text(
                 when {
                     !permission.implemented -> "本版还没实现，授权也不会生效"
-                    granted -> "已允许"
+                    granted -> if (aiGranted) "已允许 · AI 授予" else "已允许"
                     permission.dangerous -> "需要你确认"
                     else -> "未允许"
                 },

@@ -137,6 +137,13 @@ interface AttachmentHost {
      * 失败抛 [ImageStoreException]，由工具翻成上游同形文案。
      */
     suspend fun saveImage(data: ByteArray, mediaType: String, name: String?): ImageRef
+
+    /**
+     * M88-H（用户 2026-11-17）：文件入口。宿主应流式归一化（不把整个源文件读进内存），
+     * 且**不按源文件大小拒绝**。默认实现退回 [saveImage]（整读），只给测试/旧宿主兜底。
+     */
+    suspend fun saveImageFile(file: File, mediaType: String, name: String?): ImageRef =
+        saveImage(file.readBytes(), mediaType, name)
 }
 
 /** 附件归一化/存储的稳定错误码（对上游 `AttachmentError.code`）。 */

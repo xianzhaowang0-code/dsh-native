@@ -89,6 +89,13 @@ class FloatingWindowState(val context: Context) {
     var lastBallPositionX: Int = prefs.getInt(KEY_LAST_BX, x)
     var lastBallPositionY: Int = prefs.getInt(KEY_LAST_BY, y)
 
+    /**
+     * H2（docs/182）：是否真的记录过悬浮球位置。只有「离开悬浮球模式」时置 true，
+     * 旧安装/全新安装没有这个键时为 false——回程才允许回退到窗口中心，
+     * 不把 `lastBallPosition` 的默认值（200,200）当成用户拖过的位置。
+     */
+    var hasBallPosition: Boolean = prefs.getBoolean(KEY_HAS_BALL, false)
+
     var isTransitioning = false
     val transitionDebounceTime = 500L
 
@@ -140,6 +147,7 @@ class FloatingWindowState(val context: Context) {
             .putInt(KEY_LAST_WY, lastWindowPositionY)
             .putInt(KEY_LAST_BX, lastBallPositionX)
             .putInt(KEY_LAST_BY, lastBallPositionY)
+            .putBoolean(KEY_HAS_BALL, hasBallPosition)
             .apply()
     }
 
@@ -157,5 +165,6 @@ class FloatingWindowState(val context: Context) {
         const val KEY_LAST_WY = "floating_last_window_y"
         const val KEY_LAST_BX = "floating_last_ball_x"
         const val KEY_LAST_BY = "floating_last_ball_y"
+        const val KEY_HAS_BALL = "floating_has_ball"
     }
 }

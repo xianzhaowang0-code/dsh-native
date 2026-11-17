@@ -4,8 +4,11 @@ import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.key
 import androidx.compose.ui.Modifier
+import xin.dshaa.nativeapp.ui.shell.slots.LocalSlotHasMessages
+import xin.dshaa.nativeapp.ui.shell.slots.LocalSlotRegistry
 import xin.dshaa.ui.shellapi.BuiltinPageIds
 import xin.dshaa.ui.shellapi.ShellPageRegistry
 import xin.dshaa.nativeapp.memory.MemoryScreen
@@ -104,6 +107,11 @@ fun NativePageDispatch(
             val conversation = vm.conversation
             val current = conversation.state
             if (current != null) {
+                // M87-C：把插件插槽注册表和「当前会话有没有消息」交给聊天页（输入条上方 / 工具卡 body）。
+                CompositionLocalProvider(
+                    LocalSlotRegistry provides vm.slotRegistry,
+                    LocalSlotHasMessages provides current.messages.isNotEmpty(),
+                ) {
                 // 远程来源每次切换都要换一棵 ChatScreen（stateKey 带 profile/generation），
                 // 但本机会话的 stateKey 里还带 sessionId，而新会话的 sessionId 是在第一条消息
                 // 的回合里才落定的：直接拿它当组合 key 会把整棵 ChatScreen 销毁重建
@@ -156,6 +164,8 @@ fun NativePageDispatch(
                     },
                     onSubmit = { conversation.submit(it) },
                     onStop = { conversation.stop() },
+                    onContinueTruncated = { vm.continueTruncated() },
+                    outputTokenLimit = vm.settings.maxTokens,
                     capabilities = conversation.capabilities,
                     canSubmit = conversation.canSubmit,
                     connectionNotice = conversation.connectionNotice,
@@ -231,6 +241,7 @@ fun NativePageDispatch(
                     waitingElsewhere = if (conversation.isLocal) vm.waitingElsewhere() else emptyList(),
                     onFocusSession = { id -> vm.focusSession(id) },
                 )
+                }
                 }
             } else {
                 // 一帧空白：LaunchedEffect 马上会建草稿
@@ -408,7 +419,8 @@ fun NativePageDispatch(
                     versionName = vm.appVersionName,
                     versionCode = vm.appVersionCode,
                 )
-                null -> SettingsScreen(
+                null -> CompositionLocalProvider(LocalSlotRegistry provides vm.slotRegistry) {
+                    SettingsScreen(
                     settings = vm.settings,
                     onOpenDrawer = nav.openDrawer,
                     scrollState = nav.settingsScroll,
@@ -430,6 +442,7 @@ fun NativePageDispatch(
                     onOpenAbout = { nav.openSub(BuiltinPageIds.About) },
                     screenEnabled = { pageId -> vm.builtinScreenEnabled(pageId) },
                 )
+                }
             }
         }
 

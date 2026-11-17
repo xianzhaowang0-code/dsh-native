@@ -56,6 +56,14 @@ class ChatSessionState(modelName: String) {
     var queuedPrompts by mutableStateOf<List<xin.dshaa.core.session.QueuedPrompt>>(emptyList())
     var queueNotice by mutableStateOf<String?>(null)
 
+    /**
+     * H1：上一轮因 max_tokens 截断，还能「继续生成」（null = 没有入口）。
+     *
+     * 真正的持久化在 [TruncationResumeStore]（按会话 id 存 prefs）；打开会话时回填到这里。
+     * 点一次消费一次：宿主先清这里再发「继续生成」那条用户消息，重复点击拿不到第二轮。
+     */
+    var pendingContinue by mutableStateOf<TruncationKind?>(null)
+
     /** 本轮开始时间（M76 运行状态条：流式期间显示「运行中 12s」，不让人误以为卡死）。 */
     var turnStartedAt by mutableStateOf(0L)
 

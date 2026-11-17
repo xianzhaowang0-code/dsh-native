@@ -4,23 +4,26 @@ import xin.dshaa.ui.shellapi.NativeShell
 import xin.dshaa.ui.shellapi.NativeShells
 import xin.dshaa.ui.shellapi.ShellPage
 import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.SizeTransform
+import androidx.compose.animation.ExitTransition
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
-import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.width
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -28,10 +31,20 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.zIndex
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 import xin.dshaa.ui.shellapi.BuiltinPageIds
 import xin.dshaa.nativeapp.ui.shell.DshDrawer
+import xin.dshaa.nativeapp.ui.shell.slots.LocalSlotHasMessages
+import xin.dshaa.nativeapp.ui.shell.slots.LocalSlotRegistry
+import xin.dshaa.nativeapp.ui.shell.slots.SlotOverlay
 import xin.dshaa.ui.shellapi.NativeShellHost
 import xin.dshaa.ui.shellapi.NativeShellHostUi
 import xin.dshaa.ui.shellapi.PageLevel
@@ -40,26 +53,6 @@ import xin.dshaa.nativeapp.ui.shell.native.pages.NativeNav
 import xin.dshaa.nativeapp.ui.shell.native.pages.NativePageDispatch
 import xin.dshaa.nativeapp.ui.shell.native.pages.NativePages
 import xin.dshaa.ui.design.theme.DshTheme2
-
-/**
- * 当前路由快照（M79，用户 2026-11-12 反馈「二级页进出一个动画都没有」）：
- * `page` = 一级页面 id（null = 聊天），`sub` = 设置里的二级页面 id。
- * 交给 [AnimatedContent] 当 targetState，进出二级页统一走滑入/滑出 + 淡入淡出。
- *
- * M84-B：这里只存**字符串 id**（[BuiltinPageIds]），页面标题/图标/层级
- * 由 [NativePages] 清单查表；`Screen` / `SubScreen` 枚举已删除。
- * M85-C2：清单和页面渲染 dispatch 都归壳（`ui/shell/native/pages/`），宿主不再持有页面清单。
- */
-private data class NavRoute(val page: String?, val sub: String?) {
-    /** 层级：聊天 0（根） < 一级页/设置 1 < 设置二级页 2；用来决定滑动方向。 */
-    val depth: Int
-        get() = when {
-            page == null -> 0
-            sub != null -> 2
-            else -> 1
-        }
-}
-
 
 @Composable
 private fun NativeShellContent(vm: NativeShellHost, hostUi: NativeShellHostUi) {
@@ -79,6 +72,19 @@ private fun NativeShellContent(vm: NativeShellHost, hostUi: NativeShellHostUi) {
     // backSub 只在来路本身是设置二级页时非空（例如在二级页打开抽屉后再导航）。
     var backPage by rememberSaveable { mutableStateOf<String?>(null) }
     var backSub by rememberSaveable { mutableStateOf<String?>(null) }
+    // H3 补（真机导航回归 2026-11-16）：进二级页会临时把 backPage 改成 Settings 供 closeSub 用；
+    // 返回设置后必须恢复「设置页自己的返回目标」，否则「设置→二级→返回→再返回」原地卡在设置。
+    var subReturnPage by rememberSaveable { mutableStateOf<String?>(null) }
+    var subReturnSub by rememberSaveable { mutableStateOf<String?>(null) }
+    /**
+     * H4 候选 E（docs/182）：从设置首页进二级页时，设置首页留在下面继续组合；返回时不再
+     * 重新组合整页（真机实测二级页→设置单帧 150–300ms，主要是目标页首次组合）。
+     * 从聊天直进二级页（模型芯片→模型配置）时不需要重新组合设置首页，保持 false，避免多组合一页。
+     */
+    var retainSettingsHome by rememberSaveable { mutableStateOf(false) }
+    /** 最近打开过的二级页：关闭后仍保留组合（藏在设置首页后面），再进同一页不再重新组合。
+     *  只在本进程内保留；冷启恢复设置页时不把上次的二级页也组合出来做后台工作。 */
+    var lastSub by remember { mutableStateOf<String?>(null) }
     // 打开抽屉那一刻的路由快照（抽屉里的入口完成后按它返回）。
     var drawerOriginPage by rememberSaveable { mutableStateOf<String?>(null) }
     var drawerOriginSub by rememberSaveable { mutableStateOf<String?>(null) }
@@ -103,6 +109,7 @@ private fun NativeShellContent(vm: NativeShellHost, hostUi: NativeShellHostUi) {
             // 从设置页进的功能页：返回回设置（0.3.4 显式记录）
             backPage = BuiltinPageIds.Settings
             backSub = null
+            retainSettingsHome = id == BuiltinPageIds.Settings
             screenName = id
             subScreenName = null
         }
@@ -116,19 +123,28 @@ private fun NativeShellContent(vm: NativeShellHost, hostUi: NativeShellHostUi) {
             navForward = true
             backPage = null
             backSub = null
+            retainSettingsHome = false
             screenName = id
             subScreenName = null
         }
     }
-    /** 二级页统一从「设置」下挂；页面插件关掉时拒绝进入。设置内部进二级页，返回仍回设置。 */
+    /**
+     * 二级页统一从「设置」下挂；页面插件关掉时拒绝进入。
+     * H3（docs/182）：返回目标按**真实来路**记录——聊天直进（模型芯片 → 模型配置）返回聊天，
+     * 从设置进返回设置首页。0.3.4 一律记 Settings，聊天直进时返回键会「原地卡住」。
+     */
     val openSub: (String) -> Unit = { id ->
         val target = NativePages.byId(id)
         if (target != null && target.level == PageLevel.Secondary &&
             vm.builtinScreenEnabled(id)
         ) {
             navForward = true
-            backPage = BuiltinPageIds.Settings
-            backSub = null
+            val back = NativeNavBackPolicy.forOpenSub(screenName, BuiltinPageIds.Settings)
+            retainSettingsHome = screenName == BuiltinPageIds.Settings
+            subReturnPage = backPage
+            subReturnSub = backSub
+            backPage = back.page
+            backSub = back.sub
             screenName = BuiltinPageIds.Settings
             subScreenName = id
         }
@@ -142,6 +158,7 @@ private fun NativeShellContent(vm: NativeShellHost, hostUi: NativeShellHostUi) {
             navForward = true
             backPage = drawerOriginPage
             backSub = drawerOriginSub
+            retainSettingsHome = id == BuiltinPageIds.Settings
             screenName = id
             subScreenName = null
         }
@@ -153,6 +170,9 @@ private fun NativeShellContent(vm: NativeShellHost, hostUi: NativeShellHostUi) {
             vm.builtinScreenEnabled(id)
         ) {
             navForward = true
+            retainSettingsHome = drawerOriginPage == BuiltinPageIds.Settings
+            subReturnPage = backPage
+            subReturnSub = backSub
             backPage = drawerOriginPage
             backSub = drawerOriginSub
             screenName = BuiltinPageIds.Settings
@@ -169,6 +189,7 @@ private fun NativeShellContent(vm: NativeShellHost, hostUi: NativeShellHostUi) {
     }
     androidx.compose.runtime.LaunchedEffect(subScreenName) {
         val sub = subScreenName ?: return@LaunchedEffect
+        lastSub = sub
         if (!vm.builtinScreenEnabled(sub)) subScreenName = null
     }
     /** 返回：回到显式记录的来路（聊天 / 设置首页 / 对应一级页）。 */
@@ -176,12 +197,17 @@ private fun NativeShellContent(vm: NativeShellHost, hostUi: NativeShellHostUi) {
         navForward = false
         screenName = backPage
         subScreenName = backSub
+        retainSettingsHome = backPage == BuiltinPageIds.Settings
     }
-    /** 二级页返回：同样回显式记录的来路（设置内部进二级页时来路就是设置）。 */
+    /** 二级页返回：先回显式记录的来路（设置内部进二级页时来路就是设置），再恢复设置页自己的返回目标。 */
     val closeSub: () -> Unit = {
         navForward = false
-        screenName = backPage
+        val targetPage = backPage
+        screenName = targetPage
         subScreenName = backSub
+        retainSettingsHome = targetPage == BuiltinPageIds.Settings
+        backPage = subReturnPage
+        backSub = subReturnSub
     }
     // 宽屏（平板 / 折叠屏展开）侧边栏常驻：600dp 是 Material 的 compact/expanded 断点
     val wideLayout = androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp >= 600
@@ -255,6 +281,17 @@ private fun NativeShellContent(vm: NativeShellHost, hostUi: NativeShellHostUi) {
             }
         }
         vm.consumeDebugScreen()
+    }
+
+    // M87-H5：插件通知点击回到聊天落地页（用户拍板：只清页面栈，不深链会话/插件页）。
+    androidx.compose.runtime.LaunchedEffect(vm.landingChatRequest) {
+        if (vm.landingChatRequest <= 0L) return@LaunchedEffect
+        navForward = false
+        screenName = null
+        subScreenName = null
+        backPage = null
+        backSub = null
+        vm.consumeLandingChatRequest()
     }
 
     // 验收用：路由落的哪一页（logcat -s DshPage）；关掉的页面不会被记录，等于「被拦回」。
@@ -363,66 +400,149 @@ private fun NativeShellContent(vm: NativeShellHost, hostUi: NativeShellHostUi) {
     val body: @Composable () -> Unit = {
         Box(Modifier.fillMaxSize().background(c.background)) {
             // M79：所有一级页/二级页共用一套转场（用户 2026-11-12：进二级页、退出都没有动画）。
-            // 方向按层级差决定：进更深一层从右滑入，返回从左滑入；同层级用 navForward（进/退）决定。
+            // H4 候选 A（docs/182 §H4）：新页 160ms 淡入 + 1/8 屏轻位移，旧页不动画，去掉 SizeTransform。
+            // 外层 target 改成一/二级**页面**（二级页的 sub 交给内层）：从设置进二级页时设置首页
+            // 留在下面继续组合（候选 E），返回设置不再重新组合整页——真机实测那一帧要 150–300ms。
             AnimatedContent(
-                targetState = NavRoute(screenName, subScreenName),
+                targetState = screenName,
                 transitionSpec = {
-                    val forward = if (targetState.depth == initialState.depth) {
-                        navForward
-                    } else {
-                        targetState.depth > initialState.depth
-                    }
+                    val from = if (initialState == null) 0 else 1
+                    val to = if (targetState == null) 0 else 1
+                    val forward = if (from == to) navForward else to > from
                     val dir = if (forward) 1 else -1
                     (
-                        slideInHorizontally(animationSpec = tween(260)) { full -> dir * full / 5 } +
-                            fadeIn(animationSpec = tween(200))
-                        ) togetherWith (
-                        slideOutHorizontally(animationSpec = tween(260)) { full -> -dir * full / 5 } +
-                            fadeOut(animationSpec = tween(160))
-                        ) using SizeTransform(clip = false)
+                        fadeIn(animationSpec = tween(160)) +
+                            slideInHorizontally(animationSpec = tween(160)) { full -> dir * full / 8 }
+                        ) togetherWith ExitTransition.None
                 },
                 label = "dsh-screen",
-            ) { route ->
-                // M85-C2：页面内容由壳自己的 dispatch 画（标题/图标/层级都在 `NativePages`）
-                NativePageDispatch(vm, route.page, route.sub, nav, hostUi)
+            ) { page ->
+                if (page == BuiltinPageIds.Settings) {
+                    Box(Modifier.fillMaxSize()) {
+                        // 设置首页：在设置栈里一直保留组合（含二级页打开时），返回时不再重新
+                        // 组合整页；聊天直进二级页（retain=false）不组合首页，返回聊天时也不多组合。
+                        if (retainSettingsHome ||
+                            (subScreenName == null && screenName == BuiltinPageIds.Settings)
+                        ) {
+                            NativePageDispatch(vm, BuiltinPageIds.Settings, null, nav, hostUi)
+                        }
+                        // 二级页单独一层：首次打开组合；关闭后保留组合（alpha=0、zIndex 沉到首页后面），
+                        // 再进同一页直接显示，不再付整页组合的 150–300ms。
+                        // M88-F（docs/183 §6）：保留组合不变，只给这一层补位移 + alpha——
+                        // 进入 +1/10 屏宽→0 / 180ms，退出反向 140ms，同级切换 6% / 160ms。
+                        val subVisible = subScreenName != null
+                        var prevSub by remember { mutableStateOf<String?>(null) }
+                        val subShift = remember { Animatable(0f) }
+                        val subContentAlpha = remember { Animatable(1f) }
+                        val subAlpha by animateFloatAsState(
+                            targetValue = if (subVisible) 1f else 0f,
+                            animationSpec = tween(SubpageShift.durationMs(prevSub, subScreenName)),
+                            label = "dsh-sub-alpha",
+                        )
+                        val screenWidthPx = with(LocalDensity.current) {
+                            LocalConfiguration.current.screenWidthDp.dp.toPx()
+                        }
+                        LaunchedEffect(subScreenName) {
+                            val from = prevSub
+                            val to = subScreenName
+                            prevSub = to
+                            val dir = SubpageShift.dir(from, to)
+                            val fraction = SubpageShift.fraction(from, to)
+                            val ms = SubpageShift.durationMs(from, to)
+                            when {
+                                dir > 0 -> {
+                                    subShift.snapTo(fraction)
+                                    if (from != null) {
+                                        // 同级切换：6% 位移 + 一次短淡入（不是硬切）。
+                                        launch {
+                                            subContentAlpha.snapTo(0.4f)
+                                            subContentAlpha.animateTo(1f, tween(ms))
+                                        }
+                                    } else {
+                                        subContentAlpha.snapTo(1f)
+                                    }
+                                    subShift.animateTo(0f, tween(ms))
+                                }
+                                // 退出：与进入反向滑回右侧（位移取正值），同时 alpha 140ms 淡出。
+                                dir < 0 -> subShift.animateTo(fraction, tween(ms))
+                            }
+                        }
+                        val shownSub = subScreenName ?: lastSub
+                        if (shownSub != null && (subVisible || retainSettingsHome)) {
+                            Box(
+                                Modifier
+                                    .fillMaxSize()
+                                    .offset {
+                                        IntOffset((subShift.value * screenWidthPx).roundToInt(), 0)
+                                    }
+                                    .zIndex(if (subVisible || subAlpha > 0.01f) 1f else -1f)
+                                    .alpha(subAlpha * subContentAlpha.value)
+                                    .then(
+                                        if (!subVisible && subAlpha <= 0.01f) {
+                                            Modifier.clearAndSetSemantics {}
+                                        } else {
+                                            Modifier
+                                        },
+                                    ),
+                            ) {
+                                NativePageDispatch(vm, BuiltinPageIds.Settings, shownSub, nav, hostUi)
+                            }
+                        }
+                    }
+                } else {
+                    // M85-C2：页面内容由壳自己的 dispatch 画（标题/图标/层级都在 `NativePages`）
+                    NativePageDispatch(vm, page, null, nav, hostUi)
+                }
             }
         }
     }
 
-    if (wideLayout) {
-        // M83：宽屏不再用 Material 的 PermanentNavigationDrawer。它内部会再套一层
-        // PermanentDrawerSheet（默认容器色 surfaceContainerLow ≈ #FAFAFA、带圆角），
-        // 深色主题下侧边栏右上/右下角会露出两块白色缺口（用户：「四角/边缘有白色空白」）。
-        // 这里用普通 Row 拼常驻侧边栏：直角、铺满高度、紧贴左边缘，右侧一条 1dp 分隔线。
-        Row(Modifier.fillMaxSize().background(c.surface)) {
-            Box(Modifier.width(304.dp).fillMaxHeight()) { drawerContent(true) }
-            Box(Modifier.width(1.dp).fillMaxHeight().background(c.line))
-            Box(Modifier.weight(1f).fillMaxHeight()) { body() }
-        }
-    } else {
-        androidx.compose.material3.ModalNavigationDrawer(
-            drawerState = drawerState,
-            // 0.3.4（用户第 2 条）：侧边栏手势只在聊天页与设置首页生效；二级页/其它一级页不认边缘滑动。
-            // 宽屏常驻抽屉不走这里，不受影响。
-            gesturesEnabled = subScreenName == null &&
-                (screenName == null || screenName == BuiltinPageIds.Settings),
-            drawerContent = {
-                // Warm recreation in this host can leave the initial sheet at x=0 even
-                // with a correct closed offset. Keep measuring for anchors, but do not
-                // place fully closed content (including its semantics and touch targets).
-                androidx.compose.ui.layout.Layout(content = { drawerContent(false) }) { measurables, constraints ->
-                    val sheets = measurables.map { it.measure(constraints.copy(minWidth = 0, minHeight = 0)) }
-                    val width = sheets.maxOfOrNull { it.width } ?: 0
-                    val height = sheets.maxOfOrNull { it.height } ?: 0
-                    layout(width, height) {
-                        val offset = drawerState.currentOffset
-                        if (drawerState.isOpen || (!offset.isNaN() && offset > -width.toFloat())) {
-                            sheets.forEach { it.placeRelative(0, 0) }
-                        }
-                    }
+    // M87-D：把插槽注册表交给整棵壳（抽屉/浮层也要读），会话有无消息供 `when.session` 过滤。
+    val hasSlotMessages = conversation.state?.messages?.isNotEmpty() == true
+    Box(Modifier.fillMaxSize()) {
+        CompositionLocalProvider(
+            LocalSlotRegistry provides vm.slotRegistry,
+            LocalSlotHasMessages provides hasSlotMessages,
+        ) {
+            if (wideLayout) {
+                // M83：宽屏不再用 Material 的 PermanentNavigationDrawer。它内部会再套一层
+                // PermanentDrawerSheet（默认容器色 surfaceContainerLow ≈ #FAFAFA、带圆角），
+                // 深色主题下侧边栏右上/右下角会露出两块白色缺口（用户：「四角/边缘有白色空白」）。
+                // 这里用普通 Row 拼常驻侧边栏：直角、铺满高度、紧贴左边缘，右侧一条 1dp 分隔线。
+                Row(Modifier.fillMaxSize().background(c.surface)) {
+                    Box(Modifier.width(304.dp).fillMaxHeight()) { drawerContent(true) }
+                    Box(Modifier.width(1.dp).fillMaxHeight().background(c.line))
+                    Box(Modifier.weight(1f).fillMaxHeight()) { body() }
                 }
-            },
-        ) { body() }
+            } else {
+                androidx.compose.material3.ModalNavigationDrawer(
+                    drawerState = drawerState,
+                    // 0.3.4（用户第 2 条）：侧边栏手势只在聊天页与设置首页生效；二级页/其它一级页不认边缘滑动。
+                    // 宽屏常驻抽屉不走这里，不受影响。
+                    gesturesEnabled = subScreenName == null &&
+                        (screenName == null || screenName == BuiltinPageIds.Settings),
+                    drawerContent = {
+                        // Warm recreation in this host can leave the initial sheet at x=0 even
+                        // with a correct closed offset. Keep measuring for anchors, but do not
+                        // place fully closed content (including its semantics and touch targets).
+                        androidx.compose.ui.layout.Layout(content = { drawerContent(false) }) { measurables, constraints ->
+                            val sheets = measurables.map { it.measure(constraints.copy(minWidth = 0, minHeight = 0)) }
+                            val width = sheets.maxOfOrNull { it.width } ?: 0
+                            val height = sheets.maxOfOrNull { it.height } ?: 0
+                            layout(width, height) {
+                                val offset = drawerState.currentOffset
+                                if (drawerState.isOpen || (!offset.isNaN() && offset > -width.toFloat())) {
+                                    sheets.forEach { it.placeRelative(0, 0) }
+                                }
+                            }
+                        }
+                    },
+                ) { body() }
+            }
+            // M87-D：shell.overlay 画在壳最上层（Modal 抽屉 / 常驻侧边栏 / 二级页之上）。
+            // 聊天页底部是输入条：浮层让开约 128dp，别挡住发送/附件；其它页贴右下角。
+            SlotOverlay("shell.overlay", bottomInset = if (screenName == null) 128 else 0)
+        }
     }
 }
 

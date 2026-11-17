@@ -98,6 +98,15 @@ object DevicePermissions {
         NotificationManagerCompat.from(context).areNotificationsEnabled()
 
     /**
+     * M87-H5：发系统通知的运行时权限（Android 13+ 的 POST_NOTIFICATIONS）。
+     * 低版本恒 true；高版本还要配合 [notificationsEnabled] 看系统总开关。
+     */
+    fun notificationPermissionGranted(context: Context): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            context.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+
+    /**
      * 「通知使用权」是否授予（docs/76 W24 的通知附件靠它）。
      *
      * 与 [notificationsEnabled] 不是一回事：后者是本 App 自己发通知的总开关；

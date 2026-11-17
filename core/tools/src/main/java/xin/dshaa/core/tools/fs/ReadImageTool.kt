@@ -23,8 +23,13 @@ private val IMAGE_EXTENSIONS = mapOf(
     ".gif" to "image/gif",
 )
 
-/** 源文件字节上限：min(maxImageBytes 50MB, maxMessageImageBytes 200MB) = 50MB（上游部署默认值）。 */
-internal const val MAX_IMAGE_BYTES = 50L * 1024 * 1024
+/**
+ * 源文件字节数**不设上限**（M88-H，用户 2026-11-17：文件和图片引用不要 50MB 上限）。
+ *
+ * 为了避免把超大文件整块读进内存：这里只读文件头（≤16 字节）做格式嗅探，
+ * 真正的归一化交给 `AttachmentHost.saveImageFile`（`core:attachment` 流式解码 + 缩放）。
+ */
+private const val HEADER_SNIFF_BYTES = 16
 
 private val PNG_SIGNATURE = byteArrayOf(-119, 80, 78, 71, 13, 10, 26, 10) // 0x89 P N G \r \n 0x1A \n
 private val JPEG_SIGNATURE = byteArrayOf(-1, -40, -1) // FF D8 FF
@@ -46,6 +51,13 @@ fun sniffImageMediaType(data: ByteArray): String? {
     if (matchesAscii(data, 0, "GIF87a") || matchesAscii(data, 0, "GIF89a")) return "image/gif"
     if (matchesAscii(data, 0, "RIFF") && matchesAscii(data, 8, "WEBP")) return "image/webp"
     return null
+}
+
+/** 只读文件头（≤16 字节）做格式嗅探；不把源文件整读进内存。 */
+private fun readHeader(file: File): ByteArray = file.inputStream().use { input ->
+    val buffer = ByteArray(HEADER_SNIFF_BYTES)
+    val read = input.read(buffer)
+    if (read <= 0) ByteArray(0) else buffer.copyOf(read)
 }
 
 /** 路径后缀（Node `path.extname` 语义：`.hidden` / 无后缀 → 空串；`a.tar.gz` → `.gz`）。 */
@@ -93,8 +105,8 @@ fun formatImageReadOutput(displayPath: String, image: ImageRef): String {
  *
  * 三段式与上游 `dsh-tool-fs/read-image` 对齐：
  * 1. 参数/后缀/能力门 → 在读文件**之前**拒绝（省 IO，也省得模型白等）；
- * 2. 读字节 + 文件头嗅探（无后缀文件也能认）；
- * 3. 附件服务校验/归一化/落盘，产出 `<path>/<type>/<content>` 信封 + image 块。
+ * 2. 只读文件头嗅探（无后缀文件也能认；M88-H 起不整读、不限文件大小）；
+ * 3. 附件服务流式归一化/落盘，产出 `<path>/<type>/<content>` 信封 + image 块。
  *
  * 位图解码与落盘在 `core:attachment`（Android），本类保持纯 JVM，可直接单测。
  */
@@ -136,17 +148,16 @@ class ReadImageTool : DshTool {
         val displayPath = target.path
         if (!target.exists()) return ToolResult.err("cannot read \"$displayPath\": not found")
         if (!target.isFile) return ToolResult.err("cannot read \"$displayPath\": not a regular file")
-        if (target.length() > MAX_IMAGE_BYTES) {
-            return ToolResult.err("cannot read \"$displayPath\": the file exceeds the $MAX_IMAGE_BYTES-byte image limit")
-        }
 
-        val data = try {
-            withContext(Dispatchers.IO) { target.readBytes() }
+        // M88-H：只读文件头做嗅探（不再整读；源文件大小不限）。
+        val header = try {
+            withContext(Dispatchers.IO) { readHeader(target) }
         } catch (e: Exception) {
             return ToolResult.err("cannot read \"$displayPath\": ${e.message ?: e.javaClass.simpleName}")
         }
+        if (header.isEmpty()) return ToolResult.err("cannot read \"$displayPath\": the file is empty")
 
-        val sniffed = sniffImageMediaType(data)
+        val sniffed = sniffImageMediaType(header)
         if (declared != null && sniffed != null && declared != sniffed) {
             return ToolResult.err(
                 "cannot read \"$displayPath\": the $extension extension declares $declared, but the bytes use a " +
@@ -161,7 +172,7 @@ class ReadImageTool : DshTool {
             )
 
         val ref = try {
-            host.saveImage(data, mediaType, target.name)
+            host.saveImageFile(target, mediaType, target.name)
         } catch (e: ImageStoreException) {
             return ToolResult.err(imageStoreMessage(displayPath, extension, declared, mediaType, e))
         } catch (e: Exception) {
@@ -188,7 +199,7 @@ class ReadImageTool : DshTool {
                 "downscale the image and read the smaller copy"
 
         ImageStoreException.Code.IMAGE_TOO_LARGE ->
-            "cannot read \"$displayPath\": the image cannot be stored within the deployment's byte limits; " +
+            "cannot read \"$displayPath\": the image cannot be normalized within the deployment's output size limits; " +
                 "downscale the image and read the smaller copy"
 
         ImageStoreException.Code.INVALID_IMAGE ->

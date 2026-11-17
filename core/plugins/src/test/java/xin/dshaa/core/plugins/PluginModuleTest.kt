@@ -512,4 +512,76 @@ class PluginModuleTest {
         assertNull(broken.configSchema)
         assertEquals("Config 序列化不出来", broken.configError)
     }
+
+    @Test
+    fun dryRunValidatesAndCarriesSlotDeclarations() {
+        val valid = PluginModule.parseDryRun(
+            """
+            {"applied":true,"tools":[],"slots":[
+              {"slot":"chat.composer.dock","id":"mirror","order":10,
+               "when":{"session":"any"},
+               "tree":{"type":"row","children":[
+                 {"type":"text","text":"镜像","color":"brand"},
+                 {"type":"button","text":"开关","onTap":"mirror/toggle"}
+               ]}}
+            ]}
+            """.trimIndent(),
+        )
+        assertNull(valid.error)
+        assertEquals(1, valid.slots.size)
+        assertEquals("mirror", valid.slots.single().id)
+        assertEquals("chat.composer.dock", valid.slots.single().slot)
+
+        // M87-D：消息菜单 / 抽屉 / 浮层 / 消息节点四类新槽位同样进 dry-run
+        val extended = PluginModule.parseDryRun(
+            """
+            {"applied":true,"tools":[],"slots":[
+              {"slot":"chat.message.actions","id":"quote","tree":{"type":"text","text":"引用"}},
+              {"slot":"drawer.items","id":"d","tree":{"type":"text","text":"抽屉"}},
+              {"slot":"shell.overlay","id":"o","tree":{"type":"text","text":"浮层"}},
+              {"slot":"chat.node.user","id":"u","tree":{"type":"text","text":"用户"}},
+              {"slot":"chat.node.assistant","id":"a","tree":{"type":"text","text":"助手"}}
+            ]}
+            """.trimIndent(),
+        )
+        assertNull(extended.error)
+        assertEquals(
+            listOf("chat.message.actions", "drawer.items", "shell.overlay", "chat.node.user", "chat.node.assistant"),
+            extended.slots.map { it.slot },
+        )
+
+        // 未知槽位：进 error（PluginStore 据此拒绝安装，不产生半装状态）
+        val invalid = PluginModule.parseDryRun(
+            """{"applied":true,"tools":[],"slots":[{"slot":"chat.banner","id":"x","tree":{"type":"text","text":"x"}}]}""",
+        )
+        assertTrue(invalid.error!!.contains("slot/v1"))
+        assertTrue(invalid.slots.isEmpty())
+
+        // 非数组：明确报错
+        val notArray = PluginModule.parseDryRun("""{"applied":true,"tools":[],"slots":{}}""")
+        assertTrue(notArray.error!!.contains("必须是数组"))
+    }
+
+    @Test
+    fun dryRunCarriesStorageHookCounts() {
+        val hooks = PluginModule.parseDryRun(
+            """{"applied":true,"tools":[],"storageHooks":{"beforeAppend":2,"afterLoad":1}}""",
+        )
+        assertTrue(hooks.storageHooks)
+        assertNull(hooks.error)
+        // after-load-only 也算注册了钩子（常驻 runtime 要起）
+        assertTrue(
+            PluginModule.parseDryRun(
+                """{"applied":true,"tools":[],"storageHooks":{"beforeAppend":0,"afterLoad":1}}""",
+            ).storageHooks,
+        )
+        assertFalse(
+            PluginModule.parseDryRun(
+                """{"applied":true,"tools":[],"storageHooks":{"beforeAppend":0,"afterLoad":0}}""",
+            ).storageHooks,
+        )
+        // 缺字段 / 坏形状 = 没注册（不猜）
+        assertFalse(PluginModule.parseDryRun("""{"applied":true,"tools":[]}""").storageHooks)
+        assertFalse(PluginModule.parseDryRun("""{"applied":true,"tools":[],"storageHooks":{}}""").storageHooks)
+    }
 }

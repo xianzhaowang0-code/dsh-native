@@ -15,8 +15,8 @@ android {
         // showerclient / OperitTerminalCore 都是 minSdk 26（虚拟屏与 PTY 的最低要求）
         minSdk = 26
         targetSdk = 34
-        versionCode = 7
-        versionName = "0.3.4"
+        versionCode = 8
+        versionName = "0.3.5"
     }
 
     buildFeatures {
@@ -151,4 +151,5 @@ dependencies {
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
     testImplementation("junit:junit:4.13.2")
+    testImplementation(kotlin("test"))
 }
