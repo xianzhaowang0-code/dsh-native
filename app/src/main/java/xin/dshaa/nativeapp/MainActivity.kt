@@ -186,6 +186,11 @@ class MainActivity : ComponentActivity() {
             if (intent?.getBooleanExtra("dsh_node_host_on", false) == true) {
                 getSharedPreferences("dsh", 0).edit().putBoolean("debug_node_host_on", true).apply()
             }
+            // A 验收（插件页可见）：`--es dsh_node_plugin_zip <zip 绝对路径>` 直接走 NodePluginInstaller
+            // （和插件页「导入 .zip」同一条路径，绕开 SAF 选择器，锁屏也能验），成功后自动 reload 宿主。
+            intent?.getStringExtra("dsh_node_plugin_zip")?.takeIf { it.isNotBlank() }?.let { path ->
+                getSharedPreferences("dsh", 0).edit().putString("debug_node_plugin_zip", path.trim()).apply()
+            }
             // 插件重载验收：`--es dsh_plugin_reload <插件id>` 锁屏时重跑试运行（Config 变更/升级场景）
             intent?.getStringExtra("dsh_plugin_reload")?.takeIf { it.isNotBlank() }?.let { id ->
                 getSharedPreferences("dsh", 0).edit().putString("debug_plugin_reload", id.trim()).apply()

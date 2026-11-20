@@ -68,7 +68,13 @@ class NodePluginHost(private val context: Context) {
         data object Stopped : State
     }
 
-    data class PluginStatus(val module: String, val ok: Boolean, val error: String?)
+    data class PluginStatus(
+        val module: String,
+        val ok: Boolean,
+        val error: String?,
+        /** 这个插件注册了哪些工具（宿主按加载前后 `ctx.tools.schemas()` 差集算出来的）。 */
+        val tools: List<String> = emptyList(),
+    )
 
     /** 从宿主 manifest 搬过来的工具描述（参数 JSON Schema 原样保留）。 */
     data class NodeToolInfo(
@@ -78,6 +84,8 @@ class NodePluginHost(private val context: Context) {
     )
 
     private val installer = NodeRuntimeInstaller(context)
+    private val runtimeDir = java.io.File(context.filesDir, "node")
+    private val pluginInstaller = NodePluginInstaller(runtimeDir)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val mutex = Mutex()
     private val json = Json { ignoreUnknownKeys = true }
@@ -155,6 +163,9 @@ class NodePluginHost(private val context: Context) {
                     module = module,
                     ok = (plugin["ok"] as? JsonPrimitive)?.content == "true",
                     error = (plugin["error"] as? JsonPrimitive)?.content,
+                    tools = (plugin["tools"] as? kotlinx.serialization.json.JsonArray)
+                        ?.mapNotNull { (it as? JsonPrimitive)?.content }
+                        .orEmpty(),
                 )
             },
         )
@@ -298,8 +309,45 @@ class NodePluginHost(private val context: Context) {
         State.Stopped -> "已停止"
     }
 
-    /** 宿主日志尾巴（插件页排障用）。 */
-    fun tailLogs(max: Int = 20): List<String> = bridge?.tail(max) ?: process?.tail(max).orEmpty()
+    /** 宿主日志尾巴（插件页排障用）：桥上的 `host.log` 广播 + 进程 stdout 合并。 */
+    fun tailLogs(max: Int = 20): List<String> {
+        val fromBridge = bridge?.tail(max).orEmpty()
+        val fromProcess = process?.tail(max).orEmpty()
+        return (fromBridge + fromProcess).distinct().takeLast(max)
+    }
+
+    /** 清单里登记过的模块（含加载失败的）。 */
+    fun manifestModules(): List<String> = pluginInstaller.modules()
+
+    /** 重启宿主拿最新清单：相当于「重新加载插件」。返回是否成功就绪。 */
+    suspend fun reload(): Boolean {
+        monitor?.cancel()
+        monitor = null
+        mutex.withLock {
+            val ws = bridge
+            if (ws != null) {
+                ws.requestStop(STOP_ACK_MS)
+                ws.close()
+            }
+            bridge = null
+            process?.stop(STOP_GRACEFUL_MS)
+            process = null
+            _tools.value = emptyList()
+            _state.value = State.Stopped
+        }
+        restartCount = 0
+        return start()
+    }
+
+    /**
+     * 装一个插件 zip：解到 `dsh/plugins/<名字>/`、写进清单、重启宿主。
+     * 失败原因原样带回给界面（不吞）。
+     */
+    suspend fun installPluginZip(bytes: ByteArray, fallbackName: String): Result<String> {
+        val installed = pluginInstaller.installZip(bytes, fallbackName)
+        if (installed.isSuccess) reload()
+        return installed
+    }
 
     private companion object {
         const val TAG = "DshNodeHost"

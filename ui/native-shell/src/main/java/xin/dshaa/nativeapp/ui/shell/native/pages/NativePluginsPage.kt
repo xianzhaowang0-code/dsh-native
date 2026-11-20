@@ -77,6 +77,10 @@ internal fun NativePluginsPage(
         nodeHostEnabled = host.nodePluginHostEnabled,
         nodeHostState = host.nodeHostStateText,
         onToggleNodeHost = host::setNodePluginHostEnabled,
+        nodeHostPlugins = host.nodeHostPlugins,
+        nodeHostLogs = host.nodeHostLogs,
+        onReloadNodeHost = host::reloadNodeHost,
+        onImportNodePlugin = host::importNodePlugin,
         onRefreshExtensions = host::refreshPluginExtensions,
     )
 }

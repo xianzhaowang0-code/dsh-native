@@ -217,6 +217,7 @@ import xin.dshaa.nativeapp.device.tools.AndroidDeviceTools
 import xin.dshaa.nativeapp.memory.MemoryTools
 import xin.dshaa.nativeapp.device.tools.TerminalTools
 import xin.dshaa.nativeapp.node.NodePluginHost
+import xin.dshaa.ui.shellapi.NodeHostPluginUi
 import xin.dshaa.ui.shellapi.NativeShellHost
 import xin.dshaa.ui.shellapi.SlotRegistry
 import xin.dshaa.ui.shellapi.PluginExtensionInput
@@ -659,6 +660,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
 
     /** 插件页展示的宿主状态（Extracting/Ready/Failed 的人话版本）。 */
     override var nodeHostStateText by mutableStateOf("")
+        private set
+
+    /** 插件页展示：宿主里已加载的模块 + 各自注册的工具。 */
+    override var nodeHostPlugins by mutableStateOf<List<NodeHostPluginUi>>(emptyList())
+        private set
+
+    /** 插件页展示：宿主日志尾巴。 */
+    override var nodeHostLogs by mutableStateOf<List<String>>(emptyList())
         private set
 
     /** 插件页展示：插件 id → 已接入对话的工具名（未启用/参数认不出 = 不在表里）。 */
@@ -2633,6 +2642,30 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
                             "\"apiTools\":${nodeApiTools.size},\"pid\":${nodePluginHost.pid}}",
                     )
                 }
+            }
+        }
+        // A 验收：`--es dsh_node_plugin_zip <绝对路径>` → 与插件页「导入 .zip」同一条 installPluginZip 路径
+        sp.getString("debug_node_plugin_zip", null)?.takeIf { it.isNotBlank() }?.let { raw ->
+            sp.edit().remove("debug_node_plugin_zip").apply()
+            viewModelScope.launch {
+                val source = if (File(raw).isAbsolute) File(raw) else File(getApplication<Application>().filesDir, raw)
+                setNodePluginHostEnabled(true)
+                val deadline = System.currentTimeMillis() + 25_000
+                while (!nodePluginHost.isReady() && System.currentTimeMillis() < deadline) delay(200)
+                val bytes = runCatching { withContext(Dispatchers.IO) { source.readBytes() } }.getOrNull()
+                val result = if (bytes == null) {
+                    Result.failure(IllegalStateException("cannot read $raw"))
+                } else {
+                    nodePluginHost.installPluginZip(bytes, source.name)
+                }
+                result.onSuccess { installed ->
+                    refreshNodeHostDiagnostics()
+                    Log.i(
+                        "DshNodeHost",
+                        "debug import ok module=$installed modules=${nodePluginHost.manifestModules()} " +
+                            "tools=${nodeToolNames.toList()}",
+                    )
+                }.onFailure { Log.e("DshNodeHost", "debug import failed: ${it.message}", it) }
             }
         }
         // 调试通道：`am start --es dsh_send "..."`（仅 debug，用于无 IME 的自动验收）
@@ -6995,6 +7028,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
             nodeHostJob?.cancel()
             nodeHostJob = null
             nodeHostStateText = ""
+            nodeHostPlugins = emptyList()
+            nodeHostLogs = emptyList()
             runCatching { nodePluginHost.shutdown() }
             syncNodeTools()
         }
@@ -7006,7 +7041,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
         if (nodeHostJob?.isActive == true) return
         nodeHostJob = viewModelScope.launch {
             launch {
-                nodePluginHost.state.collect { nodeHostStateText = nodePluginHost.describeState() }
+                nodePluginHost.state.collect {
+                    nodeHostStateText = nodePluginHost.describeState()
+                    refreshNodeHostDiagnostics()
+                }
             }
             launch {
                 nodePluginHost.tools.collect { syncNodeTools() }
@@ -7016,6 +7054,47 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
                 Log.w("DshNodeHost", "node host start failed: ${nodePluginHost.describeState()}")
             }
             nodeHostStateText = nodePluginHost.describeState()
+            refreshNodeHostDiagnostics()
+        }
+    }
+
+    /** 插件页要的两样：已加载模块 + 各自工具、日志尾巴。 */
+    private fun refreshNodeHostDiagnostics() {
+        val ready = nodePluginHost.state.value as? NodePluginHost.State.Ready
+        nodeHostPlugins = ready?.plugins.orEmpty().map { plugin ->
+            NodeHostPluginUi(
+                module = plugin.module,
+                ok = plugin.ok,
+                error = plugin.error,
+                tools = plugin.tools,
+            )
+        }
+        nodeHostLogs = nodePluginHost.tailLogs(40)
+    }
+
+    override fun reloadNodeHost() {
+        viewModelScope.launch {
+            runCatching { nodePluginHost.reload() }
+            refreshNodeHostDiagnostics()
+        }
+    }
+
+    override fun importNodePlugin(uri: Uri) {
+        viewModelScope.launch {
+            val name = runCatching { uri.lastPathSegment?.substringAfterLast('/') }.getOrNull().orEmpty()
+            val result = runCatching {
+                val bytes = withContext(Dispatchers.IO) {
+                    val resolver = getApplication<Application>().contentResolver
+                    resolver.openInputStream(uri)?.use { it.readBytes() } ?: error("打不开这个文件：$uri")
+                }
+                nodePluginHost.installPluginZip(bytes, name.ifBlank { "plugin" }).getOrThrow()
+            }
+            result.onSuccess { specifier ->
+                Log.i("DshNodeHost", "node plugin imported: $specifier → ${nodePluginHost.describeState()}")
+            }.onFailure { error ->
+                Log.w("DshNodeHost", "node plugin import failed: ${error.message}")
+            }
+            refreshNodeHostDiagnostics()
         }
     }
 

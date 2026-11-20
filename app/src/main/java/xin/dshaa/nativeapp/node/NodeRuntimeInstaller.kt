@@ -140,7 +140,7 @@ class NodeRuntimeInstaller(private val context: Context) {
         private const val TAG = "DshNodeHost"
 
         /** 改运行时内容就要动这个版本号：它决定已装用户会不会重新解压。 */
-        const val RUNTIME_VERSION = "node26.4.0-dsh0.2.2-rc.5-p2"
+        const val RUNTIME_VERSION = "node26.4.0-dsh0.2.2-rc.5-p2.2"
 
         private const val RUNTIME_ASSET_NAME = "runtime.zip"
         private const val BUFFER_SIZE = 64 * 1024
