@@ -33,7 +33,8 @@ class SettingsStore(private val sp: SharedPreferences) {
     /**
      * docs/185 P2：Node 插件宿主。默认关——首版标实验，打开才会解压运行时并起进程（+50~120MB 常驻）。
      */
-    private val _nodePluginHostEnabled = mutableStateOf(sp.getBoolean(KEY_NODE_PLUGIN_HOST, false))
+    // 默认开：跟原生插件一样「装上就有」，不再单独做启动页；启动后 1.5s 在后台起 node 进程。
+    private val _nodePluginHostEnabled = mutableStateOf(sp.getBoolean(KEY_NODE_PLUGIN_HOST, true))
     /**
      * M88-E（docs/183 §5）：AI 全控制插件总开关。默认开；关掉后
      * `plugin_dev_grant/revoke/config/role` 四个工具返回 `ai_plugin_control_disabled`。

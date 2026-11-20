@@ -237,6 +237,16 @@ class NodePluginHost(private val context: Context) {
         }
     }
 
+    /**
+     * 拉一次插件注册的提示词段/上下文（`ctx.systemPrompt.section/context`）。
+     * 宿主没就绪或超时都返回 null —— 提示词拼装绝不能因此失败。
+     */
+    suspend fun promptPayload(): NodeHostBridge.PromptPayload? {
+        val ws = bridge ?: return null
+        if (_state.value !is State.Ready) return null
+        return runCatching { ws.prompt() }.getOrNull()
+    }
+
     /** 给模型看的工具表：名字加 `node_` 前缀，schema 原样搬。 */
     fun apiTools(): List<ApiTool> = _tools.value.map { tool ->
         ApiTool(

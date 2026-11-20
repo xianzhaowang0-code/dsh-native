@@ -27,6 +27,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
@@ -130,6 +131,7 @@ import xin.dshaa.nativeapp.data.PluginRequestMiddleware
 import xin.dshaa.nativeapp.data.TOOL_MIDDLEWARE_TIMEOUT_MS
 import xin.dshaa.core.parity.ParityJson
 import xin.dshaa.core.plugins.PluginRecord
+import xin.dshaa.core.plugins.PluginPromptSection
 import xin.dshaa.core.plugins.PluginPermissions
 import xin.dshaa.core.plugins.PluginMiddlewareSwitch
 import xin.dshaa.core.plugins.PluginRoute
@@ -283,6 +285,12 @@ private const val AGENT_TURN_TIMEOUT_MS = 120_000L
 private const val PROMPT_ASSEMBLE_TIMEOUT_MS = 8_000L
 
 /**
+ * Node 宿主「随应用后台启动」的延迟：原生插件体系和首帧先就位，再起 node 进程，
+ * 免得开机时 75MB RSS + 1.5s 解压抢 CPU（用户手动开开关时不等）。
+ */
+private const val NODE_HOST_AUTOSTART_DELAY_MS = 1_500L
+
+/**
  * 应用级状态：设置 + 会话仓库 + 当前聊天 + 工具循环。
  * 运行时暂时在 ViewModel；M2 后挪到前台服务持有的 ChatRuntimeHolder（01 §五.4）。
  */
@@ -360,7 +368,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
             onPhase("ready", "准备界面…")
             runtimeReady = true
             installRuntimeBindings()
-            if (settings.nodePluginHostEnabled) attachNodeHost()
+            if (settings.nodePluginHostEnabled) attachNodeHost(delayMs = NODE_HOST_AUTOSTART_DELAY_MS)
             consumeStartupDebug()
             refreshSessions()
         } catch (e: kotlinx.coroutines.CancellationException) {
@@ -658,6 +666,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
 
     private var nodeHostJob: Job? = null
 
+    /** 已经拉过提示词段的宿主 pid（同 pid 不重复拉）。 */
+    private var nodePromptPid = -1
+
+    private var nodePromptJob: Job? = null
+
     /** 插件页展示的宿主状态（Extracting/Ready/Failed 的人话版本）。 */
     override var nodeHostStateText by mutableStateOf("")
         private set
@@ -669,6 +682,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
     /** 插件页展示：宿主日志尾巴。 */
     override var nodeHostLogs by mutableStateOf<List<String>>(emptyList())
         private set
+
+    /**
+     * Node 宿主里的插件往系统提示注册的段/上下文（`ctx.systemPrompt.section/context`）。
+     * 宿主 Ready 后拉一次，导入/重载后重拉；拼进 [pluginPromptSections] / [pluginContextText] 同一张表。
+     */
+    @Volatile
+    private var nodePromptSections: List<PluginPromptSection> = emptyList()
+
+    @Volatile
+    private var nodePromptContexts: List<PluginPromptSection> = emptyList()
+
+    @Volatile
+    private var nodePromptVariables: Map<String, String> = emptyMap()
 
     /** 插件页展示：插件 id → 已接入对话的工具名（未启用/参数认不出 = 不在表里）。 */
     override var pluginInjected by mutableStateOf<Map<String, Set<String>>>(emptyMap())
@@ -7035,15 +7061,22 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
         }
     }
 
-    /** 起宿主（幂等）+ 订阅状态；失败只体现在状态文案里，不影响原生插件。 */
-    private fun attachNodeHost() {
+    /**
+     * 起宿主（幂等）+ 订阅状态；失败只体现在状态文案里，不影响原生插件。
+     *
+     * [delayMs] > 0 时表示「随应用后台启动」：等原生首帧和插件体系就位后再起进程，
+     * 别跟启动抢 CPU/内存（用户手动打开开关时传 0，立即生效）。
+     */
+    private fun attachNodeHost(delayMs: Long = 0) {
         if (!settings.nodePluginHostEnabled) return
         if (nodeHostJob?.isActive == true) return
         nodeHostJob = viewModelScope.launch {
+            if (delayMs > 0) delay(delayMs)
             launch {
-                nodePluginHost.state.collect {
+                nodePluginHost.state.collect { state ->
                     nodeHostStateText = nodePluginHost.describeState()
                     refreshNodeHostDiagnostics()
+                    if (state is NodePluginHost.State.Ready) refreshNodePromptAsync()
                 }
             }
             launch {
@@ -7059,8 +7092,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
     }
 
     /** 插件页要的两样：已加载模块 + 各自工具、日志尾巴。 */
-    private fun refreshNodeHostDiagnostics() {
-        val ready = nodePluginHost.state.value as? NodePluginHost.State.Ready
+    private fun refreshNodeHostDiagnostics() {        val ready = nodePluginHost.state.value as? NodePluginHost.State.Ready
         nodeHostPlugins = ready?.plugins.orEmpty().map { plugin ->
             NodeHostPluginUi(
                 module = plugin.module,
@@ -7072,10 +7104,48 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
         nodeHostLogs = nodePluginHost.tailLogs(40)
     }
 
+    /** 宿主 Ready 后拉一次插件注册的提示词段；同一进程只拉一次，`force` 用于重载后重拉。 */
+    private fun refreshNodePromptAsync(force: Boolean = false) {
+        val ready = nodePluginHost.state.value as? NodePluginHost.State.Ready ?: return
+        if (!force && nodePromptPid == ready.pid) return
+        nodePromptPid = ready.pid
+        nodePromptJob?.cancel()
+        nodePromptJob = viewModelScope.launch { refreshNodePrompt() }
+    }
+
+    private suspend fun refreshNodePrompt() {
+        val payload = nodePluginHost.promptPayload()
+        if (payload == null) {
+            nodePromptSections = emptyList()
+            nodePromptContexts = emptyList()
+            nodePromptVariables = emptyMap()
+            return
+        }
+        nodePromptSections = payload.sections.mapNotNull { it.toNodePromptSection() }
+        nodePromptContexts = payload.contexts.mapNotNull { it.toNodePromptSection() }
+        nodePromptVariables = payload.variables
+        Log.i(
+            "DshNodeHost",
+            "prompt source=${payload.source} sections=${nodePromptSections.size} " +
+                "contexts=${nodePromptContexts.size} variables=${nodePromptVariables.size} " +
+                "names=${nodePromptSections.map { it.name }}",
+        )
+    }
+
+    /** 宿主回的段：`{name, text, order?}`；没有 order 的排在原生段之后（900），同名互相覆盖。 */
+    private fun JsonObject.toNodePromptSection(): PluginPromptSection? {
+        val name = (this["name"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() } ?: return null
+        val text = (this["text"] as? JsonPrimitive)?.contentOrNull.orEmpty()
+        if (text.isBlank()) return null
+        val order = (this["order"] as? JsonPrimitive)?.intOrNull ?: 900
+        return PluginPromptSection(name = name, order = order, text = text)
+    }
+
     override fun reloadNodeHost() {
         viewModelScope.launch {
             runCatching { nodePluginHost.reload() }
             refreshNodeHostDiagnostics()
+            refreshNodePromptAsync(force = true)
         }
     }
 
@@ -7091,6 +7161,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
             }
             result.onSuccess { specifier ->
                 Log.i("DshNodeHost", "node plugin imported: $specifier → ${nodePluginHost.describeState()}")
+                refreshNodePromptAsync(force = true)
             }.onFailure { error ->
                 Log.w("DshNodeHost", "node plugin import failed: ${error.message}")
             }
@@ -9106,16 +9177,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
      * `complete:true` 会整体接管 system，手机版不启用（权限过大）。
      */
     private fun pluginPromptSections(): List<xin.dshaa.core.prompt.PromptSection> =
-        pluginsUi
-            .filter { it.enabled }
-            .flatMap { it.promptSections.filterNot { section -> section.complete } }
-            .map { section ->
+        (
+            pluginsUi
+                .filter { it.enabled }
+                .flatMap { it.promptSections.filterNot { section -> section.complete } }
+                .map { section ->
+                    xin.dshaa.core.prompt.PromptSection(
+                        name = section.name,
+                        order = section.order,
+                        text = section.text,
+                    )
+                } + nodePromptSections.map { section ->
+                // Node 插件（真 cordis 宿主）注册的段：同一张表里排序、同名互相覆盖。
                 xin.dshaa.core.prompt.PromptSection(
                     name = section.name,
                     order = section.order,
                     text = section.text,
                 )
             }
+            )
 
     /**
      * 插件用 `ctx.systemPrompt.variable(name, fn)` 求值出的变量（M74）：段文本里的 `{{name}}`
@@ -9124,6 +9204,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
     private fun pluginPromptVariables(): Map<String, String> {
         val merged = LinkedHashMap<String, String>()
         pluginsUi.filter { it.enabled }.forEach { merged.putAll(it.promptVariables) }
+        // Node 宿主里的插件（`ctx.systemPrompt.variable`）后注册的覆盖同名原生变量。
+        merged.putAll(nodePromptVariables)
         return merged
     }
 
@@ -9134,9 +9216,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
      */
     private fun pluginContextText(): String {
         val variables = pluginPromptVariables()
-        return pluginsUi
+        val native = pluginsUi
             .filter { it.enabled }
             .flatMap { it.contexts }
+        return (native + nodePromptContexts)
             .sortedWith(compareBy({ it.order }, { it.name }))
             .map { promptPack.interpolate(it.text.trim(), settings.model, providerLabel(), variables) }
             .filter { it.isNotEmpty() }

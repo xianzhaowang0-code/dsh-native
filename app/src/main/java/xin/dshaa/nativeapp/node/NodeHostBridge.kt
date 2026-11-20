@@ -47,6 +47,17 @@ class NodeHostBridge {
         val plugins: List<JsonObject>,
     )
 
+    /**
+     * 插件往系统提示里注册的段/上下文（`ctx.systemPrompt.section/context`）。
+     * [source] 是宿主实际走的路径：`assemble`（内核组装）或 `registry`（只读登记表兜底）。
+     */
+    data class PromptPayload(
+        val source: String,
+        val sections: List<JsonObject>,
+        val contexts: List<JsonObject>,
+        val variables: Map<String, String>,
+    )
+
     private val json = Json { ignoreUnknownKeys = true }
 
     private val client = OkHttpClient.Builder()
@@ -60,6 +71,7 @@ class NodeHostBridge {
 
     private val pending = ConcurrentHashMap<String, CompletableDeferred<Call>>()
     private val toolReplies = ConcurrentHashMap<String, CompletableDeferred<List<JsonObject>>>()
+    private val promptReplies = ConcurrentHashMap<String, CompletableDeferred<PromptPayload>>()
     private val ackWaiters = ConcurrentHashMap<String, CompletableDeferred<Unit>>()
     private val seq = AtomicLong(0)
 
@@ -137,8 +149,30 @@ class NodeHostBridge {
                 toolReplies.remove(id)?.complete(frame.arrayOfObjects("tools"))
             }
 
-            "host.log" -> {
-                val logText = frame.primitive("text") ?: return
+            "prompt.result" -> {
+                val id = frame.primitive("id") ?: return
+                val waiter = promptReplies.remove(id) ?: return
+                if (frame.primitive("ok") != "true") {
+                    waiter.completeExceptionally(
+                        IllegalStateException(frame.primitive("error") ?: "prompt.assemble 失败"),
+                    )
+                    return
+                }
+                val variables = (frame["variables"] as? JsonObject)
+                    ?.mapNotNull { (key, value) -> (value as? JsonPrimitive)?.content?.let { key to it } }
+                    ?.toMap()
+                    .orEmpty()
+                waiter.complete(
+                    PromptPayload(
+                        source = frame.primitive("source") ?: "registry",
+                        sections = frame.arrayOfObjects("sections"),
+                        contexts = frame.arrayOfObjects("contexts"),
+                        variables = variables,
+                    ),
+                )
+            }
+
+            "host.log" -> {                val logText = frame.primitive("text") ?: return
                 appendLog(logText)
                 onLogSink(logText)
             }
@@ -165,6 +199,8 @@ class NodeHostBridge {
         pending.clear()
         toolReplies.values.forEach { it.completeExceptionally(IllegalStateException(reason)) }
         toolReplies.clear()
+        promptReplies.values.forEach { it.completeExceptionally(IllegalStateException(reason)) }
+        promptReplies.clear()
         ackWaiters.values.forEach { it.completeExceptionally(IllegalStateException(reason)) }
         ackWaiters.clear()
     }
@@ -210,6 +246,28 @@ class NodeHostBridge {
             ?: run {
                 toolReplies.remove(id)
                 error("manifest 超时")
+            }
+    }
+
+    /** 拉一次插件注册的提示词段。失败返回 null（提示词拼装不能因为宿主卡住而失败）。 */
+    suspend fun prompt(timeoutMs: Long = 8_000): PromptPayload? {
+        val id = "p${seq.incrementAndGet()}"
+        val deferred = CompletableDeferred<PromptPayload>()
+        promptReplies[id] = deferred
+        val payload = buildJsonObject {
+            put("op", "prompt.assemble")
+            put("id", id)
+        }
+        val ws = socket
+        if (ws == null || !ws.send(payload.toString())) {
+            promptReplies.remove(id)
+            return null
+        }
+        return withTimeoutOrNull(timeoutMs) { deferred.await() }
+            ?: run {
+                promptReplies.remove(id)
+                Log.w(TAG, "prompt.assemble 超时（${timeoutMs}ms）")
+                null
             }
     }
 

@@ -389,7 +389,7 @@ fun PluginsScreen(
                                 SettingsSwitchRow(
                                     title = "Node 插件宿主（实验）",
                                     subtitle = if (nodeHostState.isBlank()) {
-                                        "另起一个 Node 进程跑真正的 dsh 插件（cordis / npm 原样零补丁），跟原生插件并存；首次打开要解压约 25MB 运行时"
+                                        "装好就用：原生先起，1.5s 后在后台起 Node 进程跑真 dsh 插件（cordis / npm 原样零补丁）；首次要解压约 25MB 运行时"
                                     } else {
                                         "状态：$nodeHostState"
                                     },
@@ -399,7 +399,8 @@ fun PluginsScreen(
                                 if (nodeHostEnabled) {
                                     RowDivider()
                                     Text(
-                                        "宿主里的工具统一以 node_ 前缀进模型工具表；崩溃会自动重启（最多 3 次）。关闭开关会回收进程与工具名。",
+                                        "插件不用进单独页面：原生插件和 Node 插件在同一个插件页里列，工具统一以 node_ 前缀进模型工具表。" +
+                                            "崩溃会自动重启（最多 3 次）；关掉开关回收进程与工具名。",
                                         color = c.faint,
                                         style = MaterialTheme.typography.labelSmall,
                                         modifier = Modifier.padding(14.dp),
