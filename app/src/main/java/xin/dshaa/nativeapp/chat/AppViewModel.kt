@@ -216,6 +216,7 @@ import com.ai.assistance.showerclient.ShellIdentity
 import xin.dshaa.nativeapp.device.tools.AndroidDeviceTools
 import xin.dshaa.nativeapp.memory.MemoryTools
 import xin.dshaa.nativeapp.device.tools.TerminalTools
+import xin.dshaa.nativeapp.node.NodePluginHost
 import xin.dshaa.ui.shellapi.NativeShellHost
 import xin.dshaa.ui.shellapi.SlotRegistry
 import xin.dshaa.ui.shellapi.PluginExtensionInput
@@ -358,6 +359,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
             onPhase("ready", "准备界面…")
             runtimeReady = true
             installRuntimeBindings()
+            if (settings.nodePluginHostEnabled) attachNodeHost()
             consumeStartupDebug()
             refreshSessions()
         } catch (e: kotlinx.coroutines.CancellationException) {
@@ -638,6 +640,26 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
     /** 当前请求可用的插件工具 schema（每次请求现取，随 `ToolRegistry` 同步刷新）。 */
     @Volatile
     private var pluginApiTools: List<ApiTool> = emptyList()
+
+    /**
+     * Node 插件宿主（docs/185 的 P2）：独立进程 + 本地 WS 桥，跟原生插件体系并存。
+     *
+     * 默认关（[xin.dshaa.ui.shellapi.data.SettingsStore.nodePluginHostEnabled]）；打开后才解压运行时、
+     * 起进程、把宿主 manifest 里的工具并进 [registry]（名字统一加 `node_` 前缀，跟原生插件不撞）。
+     */
+    private val nodePluginHost: NodePluginHost by lazy { NodePluginHost(app) }
+
+    /** Node 侧工具 schema（每次宿主 Ready 后重算）。 */
+    @Volatile
+    private var nodeApiTools: List<ApiTool> = emptyList()
+
+    private val nodeToolNames = LinkedHashSet<String>()
+
+    private var nodeHostJob: Job? = null
+
+    /** 插件页展示的宿主状态（Extracting/Ready/Failed 的人话版本）。 */
+    override var nodeHostStateText by mutableStateOf("")
+        private set
 
     /** 插件页展示：插件 id → 已接入对话的工具名（未启用/参数认不出 = 不在表里）。 */
     override var pluginInjected by mutableStateOf<Map<String, Set<String>>>(emptyMap())
@@ -2401,7 +2423,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
                 toolContext = live.toolContext,
                 stop = live.stop,
                 apiTools = {
-                    promptPack.androidApiTools().filter { it.name in offeredToolNames() } + pluginApiTools +
+                    promptPack.androidApiTools().filter { it.name in offeredToolNames() } + pluginApiTools + nodeApiTools +
                         pluginDevTools.apiTools().filter { it.name in offeredToolNames() }
                 },
                 systemPrompt = {
@@ -2587,8 +2609,33 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
             importRequest = if (File(path).isAbsolute) path else File(getApplication<Application>().filesDir, path).absolutePath
         }
         debugScreenRequest = settings.debugScreen
-        // 调试通道：`am start --es dsh_send "..."`（仅 debug，用于无 IME 的自动验收）
         val sp = getApplication<Application>().getSharedPreferences("dsh", 0)
+        // 调试通道：`--ez dsh_node_host_on true` → 打开 Node 宿主开关并等它把工具并进工具表（仅 debug）。
+        if (sp.getBoolean("debug_node_host_on", false)) {
+            sp.edit().remove("debug_node_host_on").apply()
+            setNodePluginHostEnabled(true)
+            viewModelScope.launch {
+                val deadline = System.currentTimeMillis() + 25_000
+                while (!nodePluginHost.isReady() && System.currentTimeMillis() < deadline) delay(200)
+                delay(500)
+                val merged = nodeToolNames.toList()
+                val offered = offeredToolNames().filter { it.startsWith("node_") }
+                Log.i(
+                    "DshNodeHost",
+                    "integration state=${nodePluginHost.describeState()} tools=${merged.size} names=$merged " +
+                        "apiTools=${nodeApiTools.size} offered=$offered pid=${nodePluginHost.pid} rss=${nodePluginHost.rssKb}",
+                )
+                runCatching {
+                    File(getApplication<Application>().filesDir, "node-host-integration.json").writeText(
+                        "{\"ok\":${nodePluginHost.isReady() && merged.isNotEmpty()}," +
+                            "\"state\":\"${nodePluginHost.describeState()}\"," +
+                            "\"tools\":${merged.joinToString(",", "[", "]") { "\"$it\"" }}," +
+                            "\"apiTools\":${nodeApiTools.size},\"pid\":${nodePluginHost.pid}}",
+                    )
+                }
+            }
+        }
+        // 调试通道：`am start --es dsh_send "..."`（仅 debug，用于无 IME 的自动验收）
         // 调试通道：`--es dsh_backup_export <绝对路径>` 直接导出原生备份（锁屏/无 UI 也能验，docs/59）
         sp.getString("debug_backup_export", null)?.takeIf { it.isNotBlank() }?.let { raw ->
             sp.edit().remove("debug_backup_export").apply()
@@ -6931,6 +6978,67 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
      * 先注销上一批名字（停用/删除/改名都靠这一步收回工具），再按清单注册。
      * 工具名和内置工具冲突时 [ToolRegistry.register] 拒绝，这里只打日志、不覆盖内置工具。
      */
+    // ---- Node 插件宿主（docs/185 P2） ----
+
+    override val nodePluginHostEnabled: Boolean get() = settings.nodePluginHostEnabled
+
+    /**
+     * 打开/关闭 Node 宿主。关闭时先杀掉进程树再收回工具名——宿主没了还留着 schema，
+     * 模型会一直调用一个永远失败的 `node_*` 工具。
+     */
+    override fun setNodePluginHostEnabled(enabled: Boolean) {
+        if (settings.nodePluginHostEnabled == enabled) return
+        settings.setNodePluginHostEnabled(enabled)
+        if (enabled) {
+            attachNodeHost()
+        } else {
+            nodeHostJob?.cancel()
+            nodeHostJob = null
+            nodeHostStateText = ""
+            runCatching { nodePluginHost.shutdown() }
+            syncNodeTools()
+        }
+    }
+
+    /** 起宿主（幂等）+ 订阅状态；失败只体现在状态文案里，不影响原生插件。 */
+    private fun attachNodeHost() {
+        if (!settings.nodePluginHostEnabled) return
+        if (nodeHostJob?.isActive == true) return
+        nodeHostJob = viewModelScope.launch {
+            launch {
+                nodePluginHost.state.collect { nodeHostStateText = nodePluginHost.describeState() }
+            }
+            launch {
+                nodePluginHost.tools.collect { syncNodeTools() }
+            }
+            val started = nodePluginHost.start()
+            if (!started) {
+                Log.w("DshNodeHost", "node host start failed: ${nodePluginHost.describeState()}")
+            }
+            nodeHostStateText = nodePluginHost.describeState()
+        }
+    }
+
+    /** 把宿主 manifest 里的工具并进 registry（`node_` 前缀，冲突只记日志）。 */
+    private fun syncNodeTools() {
+        runCatching {
+            val tools = nodePluginHost.dshTools()
+            val names = tools.map { it.name }.toSet()
+            (nodeToolNames - names).forEach { registry.unregister(it) }
+            nodeToolNames.clear()
+            tools.forEach { tool ->
+                if (registry.register(tool)) {
+                    nodeToolNames += tool.name
+                } else {
+                    Log.w("DshNodeHost", "工具名冲突，未注入：${tool.name}")
+                }
+            }
+            nodeApiTools = nodePluginHost.apiTools().filter { it.name in nodeToolNames }
+            nodeHostStateText = nodePluginHost.describeState()
+            Log.i("DshNodeHost", "merge tools=${nodeToolNames.size} apiTools=${nodeApiTools.size} names=$nodeToolNames")
+        }.onFailure { Log.w("DshNodeHost", "sync node tools failed: ${it.message}") }
+    }
+
     private fun syncPluginTools() {
         runCatching { loadingSnapshotStore.refresh(pluginsUi, prefs.getString("dsh_loading", null)) }
             .onSuccess { loadingSafetyNotice = it.unavailableReason }
@@ -8281,7 +8389,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
                 toolContext = childToolContext,
                 stop = stop,
                 apiTools = {
-                    promptPack.androidApiTools().filter { it.name in offeredToolNames() } + pluginApiTools +
+                    promptPack.androidApiTools().filter { it.name in offeredToolNames() } + pluginApiTools + nodeApiTools +
                         pluginDevTools.apiTools().filter { it.name in offeredToolNames() }
                 },
                 systemPrompt = {
@@ -8874,6 +8982,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app), NativeShellHost {
         // Activity 真被销毁（划掉任务/退出）：turn 跟着 viewModelScope 取消，保活服务也要收掉
         TurnKeepAliveService.stopListener = null
         TurnKeepAliveService.stop(getApplication())
+        // docs/185 P2：ViewModel 真销毁才收摊 Node 宿主（关开关只是 shutdown，不 close）。
+        runCatching { nodePluginHost.close() }
         // 悬浮窗的桥也要断开：否则悬浮窗会拿着已销毁的 ViewModel 发消息
         if (ChatMirror.host === this) ChatMirror.host = null
         ChatMirror.state = null

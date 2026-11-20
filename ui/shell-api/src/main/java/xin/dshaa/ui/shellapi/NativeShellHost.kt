@@ -249,6 +249,16 @@ interface NativeShellHost {
 
     fun setPluginMiddlewareEnabled(enabled: Boolean)
 
+    // ── docs/185 P2：Node 插件宿主（实验） ─────────────────────────────────────────
+
+    /** 插件页「扩展点」里的 Node 宿主开关（默认关）。 */
+    val nodePluginHostEnabled: Boolean
+
+    /** 宿主状态人话版：`解析运行时 42%` / `已就绪 · 4 个工具 · v26.4.0` / `启动失败：…`。 */
+    val nodeHostStateText: String
+
+    fun setNodePluginHostEnabled(enabled: Boolean)
+
     // ── M88-E：AI 全控制插件（审计 / 开关 / 撤销） ─────────────────────────────────
 
     /** 设置里的「AI 全控制插件」总开关（关 = grant/revoke/config/role 直接拒绝）。 */

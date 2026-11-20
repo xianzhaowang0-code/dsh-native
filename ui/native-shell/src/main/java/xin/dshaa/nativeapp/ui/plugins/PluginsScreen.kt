@@ -173,6 +173,10 @@ fun PluginsScreen(
     pluginExtensions: List<PluginExtensionUi> = emptyList(),
     pluginMiddlewareEnabled: Boolean = true,
     onTogglePluginMiddleware: (Boolean) -> Unit = {},
+    /** docs/185 P2：Node 插件宿主（跑真 dsh Node 插件）的开关与状态文案。 */
+    nodeHostEnabled: Boolean = false,
+    nodeHostState: String = "",
+    onToggleNodeHost: (Boolean) -> Unit = {},
     onRefreshExtensions: () -> Unit = {},
     /** M88-E：AI 授予后的横幅「撤销」与详情审计/AI 授予标记。 */
     onUndoAiGrant: () -> Unit = {},
@@ -367,6 +371,32 @@ fun PluginsScreen(
                     }
                 }
                 3 -> {
+                    // docs/185 P2：Node 插件宿主（实验）——跑真 dsh Node 插件的独立进程。
+                    item {
+                        DshCard(Modifier.fillMaxWidth()) {
+                            Column {
+                                SettingsSwitchRow(
+                                    title = "Node 插件宿主（实验）",
+                                    subtitle = if (nodeHostState.isBlank()) {
+                                        "另起一个 Node 进程跑真正的 dsh 插件（cordis / npm 原样零补丁），跟原生插件并存；首次打开要解压约 25MB 运行时"
+                                    } else {
+                                        "状态：$nodeHostState"
+                                    },
+                                    checked = nodeHostEnabled,
+                                    onCheckedChange = onToggleNodeHost,
+                                )
+                                if (nodeHostEnabled) {
+                                    RowDivider()
+                                    Text(
+                                        "宿主里的工具统一以 node_ 前缀进模型工具表；崩溃会自动重启（最多 3 次）。关闭开关会回收进程与工具名。",
+                                        color = c.faint,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        modifier = Modifier.padding(14.dp),
+                                    )
+                                }
+                            }
+                        }
+                    }
                     // M87-F：总开关 + 逐链快照（注册者/顺序/命中/耗时/异常/改写哈希）。
                     item {
                         DshCard(Modifier.fillMaxWidth()) {
