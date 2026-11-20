@@ -148,6 +148,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
@@ -1559,20 +1560,38 @@ private fun AgentSettledRow(message: ChatMessage) {
 /**
  * 子代理主动发给父代理的消息（`source.kind:"agent-message"`）：正文就是子代理的报告，
  * 界面用一张轻卡片展示（不伪装成用户气泡），让用户能看到委派结果。
+ *
+ * 折叠（2026-11-20 用户反馈「那条消息全部显示、特别长」）：报告往往是整份实现总结，
+ * 默认只显示 [AGENT_MESSAGE_COLLAPSED_LINES] 行纯文本预览 + 行数，点标题行或「展开全文」
+ * 才摊开全文（Markdown 渲染、限高 420dp 内滚，不带动整个聊天列表）；长报告才给折叠控件，
+ * 短报告保持原样全显示（折叠一个三行小消息反而是多余的交互）。
  */
 @Composable
 private fun AgentMessageRow(message: ChatMessage) {
     val c = DshTheme2.colors
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
     val raw = message.content.filter { it.type == BlockType.TEXT }.joinToString("\n") { it.text }
     val sender = Regex("^Agent (\\S+) sent a message:").find(raw)?.groupValues?.get(1).orEmpty()
     val body = raw.replaceFirst(Regex("^Agent \\S+ sent a message: \\n?"), "")
+    val lineCount = body.count { it == '\n' } + 1
+    val collapsible = body.length > AGENT_MESSAGE_COLLAPSED_CHARS || lineCount > AGENT_MESSAGE_COLLAPSED_LINES
+    // 按消息 id 记忆：同一条消息滚出屏幕再回来仍是折叠态，不同消息互不影响。
+    var expanded by rememberSaveable(message.id) { mutableStateOf(false) }
+    val showFull = expanded || !collapsible
     Surface(
         shape = RoundedCornerShape(12.dp),
         color = if (c.isDark) c.surface else Color(0xFFF3F6FD),
         border = BorderStroke(1.dp, c.brand.copy(alpha = 0.24f)),
     ) {
         Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable(enabled = collapsible) { expanded = !expanded },
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
                 Icon(Icons.Rounded.Build, null, tint = c.brand, modifier = Modifier.size(13.dp))
                 Spacer(Modifier.width(6.dp))
                 Text(
@@ -1580,13 +1599,79 @@ private fun AgentMessageRow(message: ChatMessage) {
                     style = MaterialTheme.typography.labelSmall,
                     color = c.brand,
                 )
+                if (collapsible) {
+                    Spacer(Modifier.weight(1f))
+                    Text("$lineCount 行", style = MaterialTheme.typography.labelSmall, color = c.faint)
+                    Spacer(Modifier.width(4.dp))
+                    Icon(
+                        if (expanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
+                        contentDescription = if (expanded) "收起" else "展开",
+                        tint = c.faint,
+                        modifier = Modifier.size(16.dp),
+                    )
+                }
             }
             if (body.isNotBlank()) {
                 Spacer(Modifier.height(5.dp))
-                Text(body, style = MaterialTheme.typography.bodyMedium, color = c.text)
+                if (showFull) {
+                    val bodyScroll = rememberScrollState()
+                    MarkdownText(
+                        text = body,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = c.text,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 420.dp)
+                            // 报告自己滚，不要带动整个聊天列表（与思考块同一套处理）。
+                            .consumeInnerScroll(bodyScroll)
+                            .verticalScroll(bodyScroll),
+                    )
+                } else {
+                    Text(
+                        agentMessagePreview(body),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = c.text,
+                        maxLines = AGENT_MESSAGE_COLLAPSED_LINES,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            if (collapsible) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    PresentedAction(if (expanded) "收起" else "展开全文") { expanded = !expanded }
+                    Spacer(Modifier.weight(1f))
+                    Text("${body.length} 字", style = MaterialTheme.typography.labelSmall, color = c.faint)
+                    PresentedAction("复制") { copyMessage(clipboard, context, body) }
+                }
             }
         }
     }
+}
+
+/** 折叠态的行数上限 / 字符阈值（超过任一条就出现折叠控件）。 */
+private const val AGENT_MESSAGE_COLLAPSED_LINES = 6
+private const val AGENT_MESSAGE_COLLAPSED_CHARS = 480
+
+/**
+ * 折叠预览用的纯文本：去掉 Markdown 记法（标题井号、引用符、列表符、强调/行内代码记号、
+ * 代码围栏行），否则预览里全是 `##`/`**` 这些噪音。
+ */
+private fun agentMessagePreview(body: String): String {
+    val sb = StringBuilder()
+    for (line in body.lineSequence()) {
+        val l = line.trim()
+        // 代码围栏行整行丢掉（内容仍保留，只是不再出现 ``` 噪音）
+        if (l.startsWith("```")) continue
+        when {
+            l.startsWith("#") -> sb.append(l.trimStart('#').trimStart())
+            l.startsWith("> ") -> sb.append(l.substring(2))
+            l.startsWith("- ") || l.startsWith("* ") || l.startsWith("+ ") -> sb.append("· ").append(l.substring(2))
+            else -> sb.append(l)
+        }
+        sb.append('\n')
+    }
+    val plain = sb.toString().replace(Regex("\\*\\*|__|`|~~"), "").trim()
+    return plain.ifBlank { body.trim() }
 }
 
 /**
@@ -3509,6 +3594,8 @@ private fun ToolCallCard(
     jobsPageEnabled: Boolean = true,
 ) {
     val c = DshTheme2.colors
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
     var expanded by rememberSaveable { mutableStateOf(false) }
     var previewPath by remember { mutableStateOf<String?>(null) }
     val resultText = result?.content?.filter { it.type == BlockType.TEXT }?.joinToString("") { it.text }.orEmpty()
@@ -3526,6 +3613,31 @@ private fun ToolCallCard(
     } else {
         null
     }
+    // 参数面补全（2026-11-20）：`description` / `workdir` / `timeoutMs` / 后台标记 / env 项数
+    // 之前只能在展开的原始 JSON 里读到，折叠态完全看不出这条命令在干什么、跑在哪个目录。
+    val argObject = remember(arguments) {
+        runCatching {
+            kotlinx.serialization.json.Json.parseToJsonElement(arguments.ifBlank { "{}" })
+                as? kotlinx.serialization.json.JsonObject
+        }.getOrNull()
+    }
+    fun argText(key: String): String? = argObject?.get(key)
+        ?.let { runCatching { it.jsonPrimitive.contentOrNull }.getOrNull() }
+        ?.takeIf { it.isNotBlank() }
+    val argDescription = argText("description")?.takeIf { it != compactArgs(name, arguments) }
+    val argWorkdir = argText("workdir")
+    val argTimeout = argText("timeoutMs")?.toLongOrNull()?.let {
+        if (it % 1000L == 0L) "${it / 1000}s" else "${it}ms"
+    }
+    val argBackground = argObject?.get("run_in_background")
+        ?.let { runCatching { it.jsonPrimitive.booleanOrNull }.getOrNull() } == true
+    val argEnvCount = (argObject?.get("env") as? kotlinx.serialization.json.JsonObject)?.size ?: 0
+    val argMeta = listOfNotNull(
+        "后台运行".takeIf { argBackground },
+        argTimeout?.let { "超时 $it" },
+        argWorkdir?.let { "目录 $it" },
+        if (argEnvCount > 0) "env $argEnvCount 项" else null,
+    ).joinToString(" · ")
 
     Surface(
         shape = RoundedCornerShape(12.dp),
@@ -3567,6 +3679,29 @@ private fun ToolCallCard(
                     tint = c.faint,
                     modifier = Modifier.size(17.dp),
                 )
+            }
+            // 工具卡的「人话」副行（2026-11-20 补全）：不展开也能看清这条命令干什么、跑在哪。
+            if (argDescription != null || argMeta.isNotEmpty()) {
+                Column(Modifier.padding(start = 12.dp, end = 12.dp, bottom = 6.dp)) {
+                    if (argDescription != null) {
+                        Text(
+                            argDescription,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = c.sub,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    if (argMeta.isNotEmpty()) {
+                        Text(
+                            argMeta,
+                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                            color = c.faint,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
             }
             // M87-A：插件改写了这次工具结果 → 明确标出改写者与原始哈希（证据不因改写失真）。
             result?.sourceSummary?.takeIf { it.startsWith("已由 ") }?.let { rewrite ->
@@ -3673,10 +3808,26 @@ private fun ToolCallCard(
                     )
                     if (resultText.isNotBlank()) {
                         Spacer(Modifier.height(10.dp))
-                        Text("结果", style = MaterialTheme.typography.labelSmall, color = c.faint)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("结果", style = MaterialTheme.typography.labelSmall, color = c.faint)
+                            Spacer(Modifier.weight(1f))
+                            Text(
+                                "${resultText.length} 字",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = c.faint,
+                            )
+                            PresentedAction("复制结果") { copyMessage(clipboard, context, resultText) }
+                        }
                         val resultScroll = rememberScrollState()
                         Text(
-                            resultText.take(3000),
+                            // 2026-11-20：原来硬截断到 3000 字符、不给提示也没有复制入口——长输出
+                            // （bash 尾部 30k）既看不全也拿不走；现在渲染到 [TOOL_RESULT_OPEN_CHARS]，
+                            // 超出部分明说，并提供「复制结果」拿全文。
+                            if (resultText.length > TOOL_RESULT_OPEN_CHARS) {
+                                resultText.take(TOOL_RESULT_OPEN_CHARS)
+                            } else {
+                                resultText
+                            },
                             style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace, fontSize = 12.sp),
                             color = if (failed) c.danger else c.sub,
                             modifier = Modifier
@@ -3685,6 +3836,15 @@ private fun ToolCallCard(
                                 .verticalScroll(resultScroll)
                                 .padding(top = 3.dp),
                         )
+                        if (resultText.length > TOOL_RESULT_OPEN_CHARS) {
+                            Text(
+                                "…（卡片只渲染前 $TOOL_RESULT_OPEN_CHARS 字符，实际 ${resultText.length} 字符；" +
+                                    "点「复制结果」拿全文）",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = c.faint,
+                                modifier = Modifier.padding(top = 4.dp),
+                            )
+                        }
                     }
                 }
             }
@@ -3790,6 +3950,9 @@ private fun humanBytes(bytes: Int): String = when {
     bytes >= 1024 -> String.format(java.util.Locale.US, "%.0f KB", bytes / 1024.0)
     else -> "$bytes B"
 }
+
+/** 工具结果在卡片里最多渲染多少字符（超出只提示，全文走「复制结果」）。 */
+private const val TOOL_RESULT_OPEN_CHARS = 20_000
 
 private fun compactArgs(name: String, args: String): String {
     val raw = when (name) {
