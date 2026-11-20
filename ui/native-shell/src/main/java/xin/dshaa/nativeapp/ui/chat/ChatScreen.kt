@@ -2682,6 +2682,12 @@ private fun AssistantTurn(
             else -> "正在生成回复"
         }
     }
+    // 本轮创建 / 修改 / 交付的文件：统一收到回复末尾（见 TurnFilesCard）。
+    // 页面插件关掉工具导航时，present 的交付物卡片照旧不显示。
+    val turnFiles = remember(messages, results, workspacePath, localArtifacts) {
+        collectTurnFiles(messages, results, workspacePath)
+            .filter { localArtifacts || it.action != FILE_ACTION_PRESENTED }
+    }
 
     // 设计稿 .reply：整轮回复是一张 22dp 圆角的厚透镜玻璃卡（padding 15/16/7），
     // 卡里依次是 who 行（青点 + 角色名 + 模型元信息）、思考框、正文、操作栏。
@@ -2750,25 +2756,19 @@ private fun AssistantTurn(
             }
             toolCalls.forEach { call ->
                 if (foldProcessBlocks) return@forEach
+                // 交付物卡片不再夹在过程里：统一收到本轮末尾的 TurnFilesCard。
+                if (call.name == "present") return@forEach
                 Spacer(Modifier.height(8.dp))
-                if (localArtifacts && call.name == "present") {
-                    PresentedCard(
-                        arguments = call.arguments,
-                        result = call.toolCallId?.let { results[it] },
-                        workspacePath = workspacePath,
-                    )
-                } else {
-                    ToolCallCard(
-                        name = call.name.orEmpty(),
-                        arguments = call.arguments,
-                        result = call.toolCallId?.let { results[it] },
-                        imagePath = imagePath,
-                        linksEnabled = linksEnabled,
-                        onOpenSubagent = onOpenSubagent,
-                        onOpenJobs = onOpenJobs,
-                        jobsPageEnabled = jobsPageEnabled,
-                    )
-                }
+                ToolCallCard(
+                    name = call.name.orEmpty(),
+                    arguments = call.arguments,
+                    result = call.toolCallId?.let { results[it] },
+                    imagePath = imagePath,
+                    linksEnabled = linksEnabled,
+                    onOpenSubagent = onOpenSubagent,
+                    onOpenJobs = onOpenJobs,
+                    jobsPageEnabled = jobsPageEnabled,
+                )
             }
             if (text.isNotBlank()) {
                 Spacer(Modifier.height(8.dp))
@@ -2827,6 +2827,11 @@ private fun AssistantTurn(
                     }
                 }
             }
+        }
+        // 本轮文件卡片：固定收在这一轮的最底部（正文 / 工具过程 / 操作栏之后）。
+        if (turnFiles.isNotEmpty()) {
+            Spacer(Modifier.height(10.dp))
+            TurnFilesCard(files = turnFiles, workspacePath = workspacePath)
         }
         // M87-D：助手回合 footer 附加行（插件 `chat.node.assistant`），每轮一条。
         SlotDock("chat.node.assistant", horizontalPadding = 0, verticalPadding = 2)
@@ -3018,7 +3023,11 @@ private fun ThinkingTitle(title: String, pulse: Float?) {
 private fun Int.toDp() = this.dp
 
 /**
- * `present` 的交付物卡：文件名 + 说明 + 大小 + 打开 / 分享（FileProvider）。
+ * 本轮**文件卡片**：把这一轮里创建 / 修改 / 交付的文件统一收在回复的最底部。
+ *
+ * 为什么挪到底部（用户 2026-11-20「创建或修改文件时自动把文件卡片放到最底部」）：
+ * `write` / `edit` / `present` 的卡片原来夹在过程里，把正文切得七零八落；现在正文先讲完，
+ * 产物固定收尾，滚到底一眼就能看到「这一轮动了哪些文件」。数据由 [collectTurnFiles] 汇总。
  *
  * 路径解析顺序（修复「点打开必然打不开」）：
  * 1. 工具结果里每行的**绝对路径**——PresentTool 用 `resolvePath(path, ctx)` 按会话 cwd 解析过，
@@ -3031,13 +3040,13 @@ private fun Int.toDp() = this.dp
  * directory"，所以模型传相对路径是合法调用，客户端必须自己补上工作区。
  */
 @Composable
-private fun PresentedCard(arguments: String, result: ChatMessage?, workspacePath: String?) {
-    val c = DshTheme2.colors
-    val context = LocalContext.current
-    val files = remember(arguments, result, workspacePath) {
-        mergePresentedResult(parsePresentedFiles(arguments), parsePresentedResult(result))
-    }
+private fun TurnFilesCard(files: List<PresentedFile>, workspacePath: String?) {
     if (files.isEmpty()) return
+    val c = DshTheme2.colors
+    var expanded by rememberSaveable { mutableStateOf(false) }
+    val allPresented = files.all { it.action == FILE_ACTION_PRESENTED }
+    val collapsible = files.size > TURN_FILES_PREVIEW
+    val shown = if (collapsible && !expanded) files.take(TURN_FILES_PREVIEW) else files
     Surface(
         shape = RoundedCornerShape(12.dp),
         color = c.panel,
@@ -3046,65 +3055,119 @@ private fun PresentedCard(arguments: String, result: ChatMessage?, workspacePath
     ) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Rounded.CheckCircle, null, tint = c.success, modifier = Modifier.size(16.dp))
+                Icon(
+                    if (allPresented) Icons.Rounded.CheckCircle else Icons.Rounded.FolderOpen,
+                    null,
+                    tint = if (allPresented) c.success else c.brand,
+                    modifier = Modifier.size(16.dp),
+                )
                 Spacer(Modifier.width(6.dp))
                 Text(
-                    "已产出 ${files.size} 个文件",
+                    if (allPresented) "已产出 ${files.size} 个文件" else "本轮文件 · ${files.size} 个",
                     style = MaterialTheme.typography.labelMedium,
                     color = c.text,
                     fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
                 )
-            }
-            files.forEach { file ->
-                val target = remember(file, workspacePath) { resolvePresentedFile(workspacePath, file) }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Box(
-                        Modifier.size(34.dp).clip(RoundedCornerShape(9.dp)).background(c.brandSoft),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Text(
-                            file.extensionLabel,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = c.brandBright,
-                            fontWeight = FontWeight.Bold,
-                        )
-                    }
-                    Spacer(Modifier.width(10.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text(
-                            file.name,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = c.text,
-                            fontWeight = FontWeight.Medium,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        Text(
-                            // 说明 + 大小（大小来自工具结果；没有结果时退回原始 path）
-                            listOf(file.description.ifBlank { file.path }, file.size)
-                                .filter { it.isNotBlank() }
-                                .joinToString(" · "),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = c.sub,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                    if (target != null) {
-                        PresentedAction("打开") { openPresentedFile(context, target) }
-                        PresentedAction("分享") { sharePresentedFile(context, target) }
-                    } else {
-                        Text(
-                            "位置未知",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = c.faint,
-                            modifier = Modifier.padding(horizontal = 6.dp),
-                        )
-                    }
+                if (collapsible) {
+                    Text(
+                        if (expanded) "收起" else "全部 ${files.size} 个",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = c.brand,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable { expanded = !expanded }
+                            .padding(horizontal = 6.dp, vertical = 4.dp),
+                    )
                 }
+            }
+            shown.forEach { file ->
+                TurnFileRow(file = file, workspacePath = workspacePath)
             }
         }
     }
+}
+
+/** 文件卡片里的一行：类型角标 + 文件名 + 新建/修改标记 + 说明/大小 + 打开/分享。 */
+@Composable
+private fun TurnFileRow(file: PresentedFile, workspacePath: String?) {
+    val c = DshTheme2.colors
+    val context = LocalContext.current
+    val target = remember(file, workspacePath) { resolvePresentedFile(workspacePath, file) }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(
+            Modifier.size(34.dp).clip(RoundedCornerShape(9.dp)).background(c.brandSoft),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                file.extensionLabel,
+                style = MaterialTheme.typography.labelSmall,
+                color = c.brandBright,
+                fontWeight = FontWeight.Bold,
+            )
+        }
+        Spacer(Modifier.width(10.dp))
+        Column(Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    file.name,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = c.text,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+                if (file.action.isNotBlank()) {
+                    Spacer(Modifier.width(6.dp))
+                    FileActionChip(file.action)
+                }
+            }
+            Text(
+                // 说明 + 大小（大小来自工具结果；没有结果时退回原始 path）
+                listOf(file.description.ifBlank { file.path }, file.size)
+                    .filter { it.isNotBlank() }
+                    .joinToString(" · "),
+                style = MaterialTheme.typography.bodySmall,
+                color = c.sub,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (target != null) {
+            PresentedAction("打开") { openPresentedFile(context, target) }
+            PresentedAction("分享") { sharePresentedFile(context, target) }
+        } else {
+            Text(
+                "位置未知",
+                style = MaterialTheme.typography.labelSmall,
+                color = c.faint,
+                modifier = Modifier.padding(horizontal = 6.dp),
+            )
+        }
+    }
+}
+
+/** `新建` / `修改` / `已产出` 小标记（14% 淡底 + 同色字）。 */
+@Composable
+private fun FileActionChip(action: String) {
+    val c = DshTheme2.colors
+    val tint = when (action) {
+        FILE_ACTION_CREATED -> c.success
+        FILE_ACTION_EDITED -> c.brand
+        else -> c.brandBright
+    }
+    Text(
+        action,
+        style = MaterialTheme.typography.labelSmall,
+        color = tint,
+        modifier = Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(tint.copy(alpha = 0.14f))
+            .padding(horizontal = 6.dp, vertical = 1.dp),
+    )
 }
 
 /** 卡片行尾的小按钮（打开 / 分享）。 */
@@ -3131,6 +3194,8 @@ private data class PresentedFile(
     val description: String,
     val absolutePath: String? = null,
     val size: String = "",
+    /** 这个文件在本轮里是怎么来的：`新建` / `修改` / `已产出`（present）。 */
+    val action: String = "",
 ) {
     private val displayPath: String get() = absolutePath ?: path
     val name: String get() = displayPath.substringAfterLast('/')
@@ -3203,6 +3268,82 @@ private fun resolvePresentedFile(workspacePath: String?, file: PresentedFile): F
     if (direct.isAbsolute) return direct
     val root = workspacePath?.takeIf { it.isNotBlank() } ?: return null
     return File(root, raw)
+}
+
+/** 文件卡片里每条的本轮来源。 */
+private const val FILE_ACTION_CREATED = "新建"
+private const val FILE_ACTION_EDITED = "修改"
+private const val FILE_ACTION_PRESENTED = "已产出"
+
+/** 文件卡片默认最多铺几行，超出的折在「全部 N 个」里。 */
+private const val TURN_FILES_PREVIEW = 6
+
+/** 会改动文件的工具：write 新建或覆盖、edit 局部替换（与 core/tools FileTools 的 name 对齐）。 */
+private val fileMutatingTools = setOf("write", "edit")
+
+/** 工具参数里的 `file_path`（write / edit 都用这个名字）。 */
+private val toolFilePathRegex = Regex("\"file_path\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"")
+
+/** 从工具参数 JSON 里取 `file_path`，并把 JSON 转义还原成真实路径。 */
+private fun parseToolFilePath(arguments: String): String? {
+    val raw = toolFilePathRegex.find(arguments)?.groupValues?.get(1) ?: return null
+    return raw.replace("\\\"", "\"")
+        .replace("\\\\", "\\")
+        .replace("\\/", "/")
+        .ifBlank { null }
+}
+
+/**
+ * 汇总一轮里的文件：`present` 的交付物 + `write` / `edit` 改动的文件，按绝对路径去重，
+ * `present` 优先（它带说明和大小）。顺序 = 首次出现的顺序。
+ *
+ * 失败 / 结果没回来的调用**不进卡片**（工具卡片里仍留着原始错误，证据不丢）。
+ */
+private fun collectTurnFiles(
+    messages: List<ChatMessage>,
+    results: Map<String, ChatMessage>,
+    workspacePath: String?,
+): List<PresentedFile> {
+    val out = LinkedHashMap<String, PresentedFile>()
+    fun keyOf(file: PresentedFile): String {
+        val raw = file.absolutePath?.takeIf { it.isNotBlank() }
+            ?: resolvePresentedFile(workspacePath, file)?.path
+            ?: file.path
+        return runCatching { File(raw).canonicalPath }.getOrDefault(raw)
+    }
+    messages.forEach { message ->
+        message.content.filter { it.type == BlockType.TOOL_CALL }.forEach { call ->
+            val name = call.name.orEmpty()
+            val result = call.toolCallId?.let { results[it] }
+            val resultText = result?.content
+                ?.filter { it.type == BlockType.TEXT }
+                ?.joinToString("") { it.text }
+                .orEmpty()
+            when {
+                name == "present" -> {
+                    mergePresentedResult(parsePresentedFiles(call.arguments), parsePresentedResult(result))
+                        .forEach { file ->
+                            val withAction = file.copy(action = FILE_ACTION_PRESENTED)
+                            out[keyOf(withAction)] = withAction
+                        }
+                }
+                name in fileMutatingTools -> {
+                    if (result == null || toolResultLooksFailed(resultText)) return@forEach
+                    val path = parseToolFilePath(call.arguments) ?: return@forEach
+                    val created = name == "write" && resultText.contains("Created file")
+                    val file = PresentedFile(
+                        path = path,
+                        description = "",
+                        action = if (created) FILE_ACTION_CREATED else FILE_ACTION_EDITED,
+                    )
+                    val key = keyOf(file)
+                    // present 的条目带说明和大小，不要被 write/edit 的简版覆盖
+                    if (out[key] == null) out[key] = file
+                }
+            }
+        }
+    }
+    return out.values.toList()
 }
 
 /** FileProvider 的 authority 与 AndroidManifest 里的声明一致（无 applicationIdSuffix）。 */
